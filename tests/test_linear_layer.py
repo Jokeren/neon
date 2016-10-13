@@ -53,7 +53,7 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize('allrand_args', fargs)
 
 
-def test_linear_zeros(backend_default, basic_linargs):
+def test_linear_zeros(backend_default, basic_linargs, deltas_buffer):
     # basic sanity check with 0 weights random inputs
     nin, nout, batch_size = basic_linargs
     NervanaObject.be.bsz = batch_size
@@ -66,7 +66,11 @@ def test_linear_zeros(backend_default, basic_linargs):
     layer.configure(nin)
     layer.prev_layer = True  # Hack to force delta buffer allocation
     layer.allocate()
-    layer.set_deltas([layer.be.iobuf(nin)])
+
+    layer.allocate_deltas(deltas_buffer)
+    deltas_buffer.allocate_buffers()
+    layer.set_deltas(deltas_buffer)
+
     out = layer.fprop(inp).get()
 
     assert np.min(out) == 0.0 and np.max(out) == 0.0
@@ -81,7 +85,7 @@ def test_linear_zeros(backend_default, basic_linargs):
     return
 
 
-def test_linear_ones(backend_default, basic_linargs):
+def test_linear_ones(backend_default, basic_linargs, deltas_buffer):
     # basic sanity check with all ones on the inputs
     # and weights, check that each row in output
     # is the sum of the weights for that output
@@ -98,19 +102,23 @@ def test_linear_ones(backend_default, basic_linargs):
     layer.configure(nin)
     layer.prev_layer = True  # Hack to force delta buffer allocation
     layer.allocate()
-    layer.set_deltas([layer.be.iobuf(nin)])
+
+    layer.allocate_deltas(deltas_buffer)
+    deltas_buffer.allocate_buffers()
+    layer.set_deltas(deltas_buffer)
+
     out = layer.fprop(inp).get()
     w = layer.W.get()
     sums = np.sum(w, 1).reshape((nout, 1)) * np.ones((1, batch_size))
 
     # for larger layers need to estimate numerical precision
     # atol = est_mm_prec(w, inp.get())
-    assert (np.allclose(sums, out, atol=0.0, rtol=0.0), '%e'
-            % np.max(np.abs(out - sums)))
+    assert np.allclose(sums, out, atol=0.0, rtol=0.0), \
+        '%e' % np.max(np.abs(out - sums))
     return
 
 
-def test_all_rand(backend_default, allrand_args):
+def test_all_rand(backend_default, allrand_args, deltas_buffer):
     # test with random weights and random inputs
     dtypeu = np.float32
     w_rng, rngmax = allrand_args
@@ -129,7 +137,11 @@ def test_all_rand(backend_default, allrand_args):
     layer.configure(nin)
     layer.prev_layer = True  # Hack to force delta buffer allocation
     layer.allocate()
-    layer.set_deltas([layer.be.iobuf(nin)])
+
+    layer.allocate_deltas(deltas_buffer)
+    deltas_buffer.allocate_buffers()
+    layer.set_deltas(deltas_buffer)
+
     out = layer.fprop(layer.be.array(inp)).get()
     w = layer.W.get()
 
@@ -138,8 +150,8 @@ def test_all_rand(backend_default, allrand_args):
 
     # for larger layers need to estimate numerical precision
     atol = 2 * est_mm_prec(w, inp, ntrials=1)
-    assert (np.allclose(out_exp, out, atol=atol, rtol=0.0),
-            '%e %e' % (np.max(np.abs(out - out_exp)), atol))
+    assert np.allclose(out_exp, out, atol=atol, rtol=0.0), \
+        '%e %e' % (np.max(np.abs(out - out_exp)), atol)
 
     err = np.random.random((nout, batch_size))
     err = err * (inp_rng[1] - inp_rng[0]) + inp_rng[0]
@@ -149,13 +161,13 @@ def test_all_rand(backend_default, allrand_args):
 
     deltas_exp = np.dot(w.T, err)
     atol = 2 * est_mm_prec(w.T, err, ntrials=1)
-    assert (np.allclose(deltas_exp, deltas, atol=atol, rtol=0.0),
-            '%e %e' % (np.max(np.abs(deltas_exp - deltas)), atol))
+    assert np.allclose(deltas_exp, deltas, atol=atol, rtol=0.0), \
+        '%e %e' % (np.max(np.abs(deltas_exp - deltas)), atol)
 
     dw_exp = np.dot(err, inp.T)
     atol = 2 * est_mm_prec(err, inp.T, ntrials=1)
-    assert (np.allclose(dw_exp, dw, atol=atol, rtol=0.0),
-            '%e %e' % (np.max(np.abs(dw_exp - dw)), atol))
+    assert np.allclose(dw_exp, dw, atol=atol, rtol=0.0), \
+        '%e %e' % (np.max(np.abs(dw_exp - dw)), atol)
 
     return
 

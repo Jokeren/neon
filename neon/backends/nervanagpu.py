@@ -34,7 +34,8 @@ from neon import logger as neon_logger
 from neon.backends import kernel_specs
 from neon.backends.backend import Tensor, Backend, OpTreeNode, OpCollection
 from neon.backends.layer_gpu import ConvLayer, DeconvLayer, PoolLayer, _get_sm_count
-from neon.backends.kernels.cuda import pooling, roipooling, binary
+from neon.backends.kernels.cuda import pooling, roipooling, binary, nms
+from neon.backends.util.check_gpu import get_compute_capability
 from neon.util.persist import get_cache_dir
 from scikits.cuda import cublas
 
@@ -99,17 +100,23 @@ class GPUTensor(Tensor):
 
         dtype = np.dtype(dtype)
 
-        if isinstance(shape, (tuple, list)) and len(shape) < self._min_dims:
-            shape = shape + (1, )
-
-        try:
-            size = 1
-            for dim in shape:
-                size *= dim
-        except TypeError:
+        if not isinstance(shape, (tuple, list)):
             assert isinstance(shape, (int, np.integer))
-            size = shape
-            shape = (shape, 1)
+            shape = (int(shape), )
+
+        if isinstance(shape, (tuple, list)) and len(shape) < self._min_dims:
+            shape = shape + (1, )*(self._min_dims - len(shape))
+
+        shape_ = []
+        size = 1
+        for dim in shape:
+            if int(dim) != dim:
+                raise TypeError('shape dims must be integer values [%s]' % str(dim))
+            dim = int(dim)
+            shape_.append(dim)
+            size *= dim
+        # shape_ will only have int elements (e.g. instead of np.int64)
+        shape = tuple(shape_)
 
         if isinstance(size, np.integer):
             size = np.asscalar(size)
@@ -777,7 +784,6 @@ class NervanaGPU(Backend):
         self.compute_capability = drv.Device(self.device_id).compute_capability()
         if self.compute_capability[0] < 5:
             self.use_cudac_kernels = True
-            self.cublas_handle = cublas.cublasCreate()
 
             logger.warn("Neon is highly optimized for Maxwell GPUs. Although "
                         "you might get speedups over CPUs, note that you are "
@@ -787,6 +793,7 @@ class NervanaGPU(Backend):
                         "info@nervanasys.com")
         else:
             self.use_cudac_kernels = False
+        self.cublas_handle = cublas.cublasCreate()
 
         self.enable_winograd = enable_winograd
         self.cache_dir = get_cache_dir()
@@ -1396,7 +1403,9 @@ class NervanaGPU(Backend):
                          allocator=other_ary.allocator,
                          rounding=self.round_mode)._assign(0)
 
-    def compound_dot(self, A, B, C, alpha=1.0, beta=0.0, relu=False, bsum=None, repeat=1, size=None):
+    def compound_dot(self, A, B, C, alpha=1.0, beta=0.0, relu=False, bsum=None,
+                     repeat=1, size=None):
+
         """
         Doing following operations (* is dot product)
         C = alpha * A * B   + beta * C
@@ -1418,7 +1427,7 @@ class NervanaGPU(Backend):
         """
         assert A.dtype.type == B.dtype.type == C.dtype.type
 
-        if self.use_cudac_kernels:
+        if self.use_cudac_kernels or B.shape[1] == 1:
             for r in range(repeat):
                 self.cublas_dot(A=A, B=B, C=C, alpha=alpha, beta=beta)
 
@@ -2356,6 +2365,55 @@ class NervanaGPU(Backend):
 
         kernel.prepared_async_call(*params)
 
+    def nms(self, detections, threshold):
+        """
+        Function to perform non-maximal supression.
+
+        Arguments:
+            detections (Tensor): detection boxes (box_count, 5), each row has
+                                 (x1, y1, x2, y2, score). Assume the boxes have already
+                                 been sorted based on score in descending order
+            threshold (float): box overlap threshold, boxes with smaller overlaps will be kept
+
+        Outputs:
+            keep_ind (list): list of indices 
+        """
+        def div_ceil(N, thread):
+            return int((N) / (thread) + ((N) % (thread) > 0))
+
+        box_count = detections.shape[0]
+        threadsPerBlock = 32
+        # decide on how many blocks to use for each dimension, and use 2D blocks
+        col_blocks = div_ceil(box_count, threadsPerBlock)
+
+        assert detections.shape == (box_count, 5)
+
+        mask_size = box_count*col_blocks
+        output_mask = self.zeros((mask_size), dtype=np.uint32)
+
+        params = [(col_blocks, col_blocks, 1), (threadsPerBlock, 1, 1), self.stream, box_count,
+                   threshold, detections.gpudata, output_mask.gpudata]
+
+        kernel = nms._get_nms_kernel()
+
+        kernel.prepared_async_call(*params)
+
+        mask_cpu = output_mask.get().ravel()
+        num_to_keep = 0
+        keep = np.zeros((box_count), dtype=np.int32)
+        remv = np.zeros((col_blocks), dtype=np.uint32)
+
+        for i in range(box_count):
+            nblock = int(i / threadsPerBlock)
+            inblock = int(i % threadsPerBlock)
+
+            if (remv[nblock] & (1 << inblock)) == 0:
+                keep[num_to_keep] = i
+                num_to_keep += 1
+                for j in range(nblock, col_blocks):
+                    remv[j] |= mask_cpu[i * col_blocks + j]
+
+        return keep[:num_to_keep].tolist()
 
     def compound_fprop_bn(self, x, xsum, xvar, gmean, gvar, gamma, beta, y, eps, rho,
                           accumbeta=0.0, relu=False, threads=None, repeat=1,
@@ -2924,9 +2982,14 @@ class NervanaGPU(Backend):
         k = A.shape[1]
 
         # Swap A and B to map from C order to Fortran
-        if A.dtype == np.float32:
-            cublas.cublasSgemm(self.cublas_handle, opB, opA, n, m, k, alpha, B.gpudata,
-                               ldb, A.gpudata, lda, beta, C.gpudata, ldc)
+        if A.dtype == np.float32 or (A.dtype == np.float16 and get_compute_capability() >= 5.2):
+            if n != 1 or (opA == 't' and opB == 'n'):
+                cublas.cublasSgemm(self.cublas_handle, opB, opA, n, m, k, alpha, B.gpudata,
+                                   ldb, A.gpudata, lda, beta, C.gpudata, ldc)
+            else:
+                cublas.cublasSgemv(self.cublas_handle, 't', k, m, alpha, A.gpudata,
+                                   k, B.gpudata, ldb, beta, C.gpudata, ldc)
+
         elif A.dtype == np.float16:
             #fp16 gemm not supported by cublas until 7.5, so do conversion
             A_temp = self._buf_malloc((A.shape[0], A.shape[1] * 2))
@@ -2943,8 +3006,15 @@ class NervanaGPU(Backend):
             A_fp32[:] = A
             B_fp32[:] = B
             C_fp32[:] = C
-            cublas.cublasSgemm(self.cublas_handle, opB, opA, n, m, k, alpha, B_fp32.gpudata,
-                               ldb, A_fp32.gpudata, lda, beta, C_fp32.gpudata, ldc)
+
+            if n != 1 or (opA == 't' and opB == 'n'):
+                cublas.cublasSgemm(self.cublas_handle, opB, opA, n, m, k, alpha,
+                                   B_fp32.gpudata, ldb, A_fp32.gpudata, lda, beta,
+                                   C_fp32.gpudata, ldc)
+            else:
+                cublas.cublasSgemv(self.cublas_handle, 't', k, m, alpha, A_fp32.gpudata,
+                                   k, B_fp32.gpudata, ldb, beta, C_fp32.gpudata, ldc)
+
             C[:] = C_fp32
 
             self._buf_free()

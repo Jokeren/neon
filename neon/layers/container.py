@@ -13,13 +13,14 @@
 # limitations under the License.
 # ----------------------------------------------------------------------------
 
-from builtins import str, zip
+from builtins import str, zip, range
 import numpy as np
 import itertools as itt
 from operator import add
 
 from neon import NervanaObject
-from neon.layers.layer import Layer, BranchNode, Dropout, DataTransform
+from neon.layers.layer import Layer, BranchNode, Dropout, DataTransform, LookupTable
+from neon.layers.recurrent import Recurrent, get_steps
 from neon.util.persist import load_class
 from functools import reduce
 
@@ -31,6 +32,45 @@ def flatten(item):
                 yield j
     else:
         yield item
+
+
+class DeltasTree(NervanaObject):
+    """
+    Data structure for maintaining nested global delta buffers
+    """
+    def __init__(self, parent=None):
+        self.parent = None
+        self.child = None
+        self.buffers = [None]*2
+        self.max_shape = 0
+        if parent:
+            assert type(parent) is DeltasTree
+            self.parent = parent
+
+    def decend(self):
+        if self.child is None:
+            self.child = DeltasTree()
+        return self.child
+
+    def ascend(self):
+        return self.parent
+
+    def proc_layer(self, layer):
+        in_size = layer.be.shared_iobuf_size(layer.in_shape,
+                                             layer.parallelism)
+        if in_size > self.max_shape:
+            self.max_shape = in_size
+
+    def allocate_buffers(self):
+        if self.child:
+            self.child.allocate_buffers()
+
+        for ind in range(len(self.buffers)):
+            if self.buffers[ind] is None:
+                if self.max_shape > 0:
+                    self.buffers[ind] = self.be.iobuf(self.max_shape,
+                                                      persist_values=False,
+                                                      parallelism="Data")
 
 
 class LayerContainer(Layer):
@@ -50,6 +90,10 @@ class LayerContainer(Layer):
                 lto.append(l)
         return lto
 
+    @property
+    def nest_deltas(self):
+        return False
+
     def nested_str(self, level=0):
         """
         Utility function for displaying layer info with a given indentation level.
@@ -68,13 +112,16 @@ class LayerContainer(Layer):
     @classmethod
     def gen_class(cls, pdict):
         layers = []
+
         for layer in pdict['layers']:
             typ = layer['type']
             ccls = load_class(typ)
             layers.append(ccls.gen_class(layer['config']))
 
-        # layers is special in that there may be parameters
-        # serialized which will be used elsewhere
+        # the 'layers' key  is special in that the layer
+        # parameters are in there and need to be saved the
+        # whole pdict['layers'] element can not be replaced
+        # with the just the layer objects like elsewhere
         lsave = pdict.pop('layers')
         new_cls = cls(layers=layers, **pdict)
         pdict['layers'] = lsave
@@ -150,6 +197,36 @@ class LayerContainer(Layer):
         for l in self.layers:
             l.set_seq_len(S)
 
+    def set_deltas(self, global_deltas):
+        """
+        Set the layer deltas from the shared
+        global deltas pool
+        """
+        for l in self.layers:
+            l.set_deltas(global_deltas)
+
+    def layers_fprop(self):
+        """
+        Generator to iterator over the layers in the same
+        order as fprop
+        """
+        for layer in self.layers:
+            yield layer
+            if hasattr(layer, 'layers_fprop'):
+                for layer2 in layer.layers_fprop():
+                    yield layer2
+
+    def layers_bprop(self):
+        """
+        Generator to iterator over the layers in the same
+        order as bprop
+        """
+        for layer in reversed(self.layers):
+            if hasattr(layer, 'layers_bprop'):
+                for layer2 in layer.layers_bprop():
+                    yield layer2
+            yield layer
+
 
 class Sequential(LayerContainer):
     """
@@ -176,8 +253,20 @@ class Sequential(LayerContainer):
         Arguments:
             in_obj: any object that has an out_shape (Layer) or shape (Tensor, dataset)
         """
-        config_layers = self.layers if in_obj else self._layers
-        in_obj = in_obj if in_obj else self.layers[0]
+        if in_obj:
+            config_layers = self.layers
+            in_obj = in_obj
+        else:
+            in_obj = self.layers[0]
+
+            # Remove the initial branch nodes from the layers
+            for l_idx, l in enumerate(self.layers):
+                if type(l) in (BranchNode,):
+                    continue
+                else:
+                    config_layers = self.layers[l_idx:]
+                    break
+
         super(Sequential, self).configure(in_obj)
         prev_layer = None
         for l in config_layers:
@@ -204,27 +293,18 @@ class Sequential(LayerContainer):
             l.allocate()
 
     def allocate_deltas(self, global_deltas=None):
-        def needs_extra_delta(ll):
-            return True if issubclass(ll.__class__, Broadcast) else False
+        if global_deltas is None:
+            self.global_deltas = DeltasTree()
 
-        self.global_deltas = global_deltas
+            st_ind = 0 if getattr(self.layers[0], 'nest_deltas', False) else 1
+            for layer in self.layers[st_ind:]:
+                layer.allocate_deltas(self.global_deltas)
 
-        if self.global_deltas is None:
-            # See if we have any inception-ish layers:
-            max_in_size = 0
-            for l in self.layers[1:]:
-                in_size = self.be.shared_iobuf_size(l.in_shape, l.parallelism)
-                if in_size > max_in_size:
-                    max_in_size = in_size
+            self.global_deltas.allocate_buffers()
+        else:
+            self.global_deltas = global_deltas
 
-            ndelta_bufs = 4 if any([needs_extra_delta(l) for l in self.layers]) else 2
-            if max_in_size != 0:
-                self.global_deltas = [self.be.iobuf(
-                    max_in_size, persist_values=False,
-                    parallelism="Data") for _ in range(ndelta_bufs)]
-
-        for l in self.layers:
-            l.set_deltas(self.global_deltas)
+        self.set_deltas(self.global_deltas)
 
     def fprop(self, inputs, inference=False, beta=0.0):
         """
@@ -245,9 +325,9 @@ class Sequential(LayerContainer):
             l.revert_list = [altered_tensor] if altered_tensor else []
 
             if l is self.layers[-1] and beta != 0:
-                x = l.fprop(x, inference, beta=beta)
+                x = l.fprop(x, inference=inference, beta=beta)
             else:
-                x = l.fprop(x, inference)
+                x = l.fprop(x, inference=inference)
 
         if inference:
             self.revert_tensors()
@@ -272,7 +352,6 @@ class Sequential(LayerContainer):
             altered_tensor = l.be.distribute_data(error, l.parallelism)
             if altered_tensor:
                 l.revert_list.append(altered_tensor)
-
             if type(l.prev_layer) is BranchNode or l is self._layers[0]:
                 error = l.bprop(error, alpha, beta)
             else:
@@ -359,7 +438,6 @@ class Tree(LayerContainer):
         """
         super(Tree, self).configure(in_obj)
         self.layers[0].configure(in_obj)
-
         for l in self.layers[1:]:
             l.configure(None)
         self.out_shape = [l.out_shape for l in self.layers]
@@ -379,7 +457,7 @@ class Tree(LayerContainer):
 
     def allocate_deltas(self, global_deltas=None):
         for l in reversed(self.layers):
-            l.allocate_deltas()
+            l.allocate_deltas(global_deltas)
 
     def fprop(self, inputs, inference=False):
         """
@@ -392,10 +470,10 @@ class Tree(LayerContainer):
             Tensor: output data
         """
         x = self.layers[0].fprop(inputs, inference)
-        out = [x] + [l.fprop(None) for l in self.layers[1:]]
+        out = [x] + [l.fprop(None, inference=inference) for l in self.layers[1:]]
         return out
 
-    def bprop(self, error):
+    def bprop(self, error, alpha=1.0, beta=0.0):
         """
         Apply the backward pass transformation to the input data.
 
@@ -462,6 +540,10 @@ class Broadcast(LayerContainer):
         self.owns_output = True
         self.outputs = None
 
+    @property
+    def nest_deltas(self):
+        return True
+
     def __str__(self):
         ss = '\n\t'.join([str(l) for l in self.layers])
         ss = '\t' + self.classnm + '\n\t' + ss
@@ -487,6 +569,13 @@ class Broadcast(LayerContainer):
         self._configure_merge()
         return self
 
+    def allocate_deltas(self, global_deltas):
+        nested_deltas = global_deltas.decend()
+        for layer in self.layers:
+            layer.layers[0].allocate_deltas(global_deltas)
+            for sublayer in layer.layers[1:]:
+                sublayer.allocate_deltas(nested_deltas)
+
     def set_deltas(self, delta_buffers):
         """
         Use pre-allocated (by layer containers) list of buffers for backpropagated error.
@@ -495,21 +584,26 @@ class Broadcast(LayerContainer):
         so do not own their deltas).
 
         Arguments:
-            delta_buffers (list): list of pre-allocated tensors (provided by layer container)
+            delta_buffers (DeltasTree): list of pre-allocated tensors (provided by layer container)
         """
-        assert len(delta_buffers) == 4, "Need extra delta buffer pool for broadcast layers"
+        bottom_buffer = delta_buffers.buffers[0]
+
+        nested_deltas = delta_buffers.decend()
+        assert nested_deltas is not None
         for l in self.layers:
-            l.allocate_deltas(delta_buffers[1:3])
-            l.layers[0].set_deltas(delta_buffers[0:1])
+            l.layers[0].set_deltas(delta_buffers)
+            delta_buffers.buffers.reverse()  # undo that last reverse
+            for sublayer in l.layers[1:]:
+                sublayer.set_deltas(nested_deltas)
 
         # Special case if originating from a branch node
         if type(self.prev_layer) is BranchNode:
             self.deltas = self.be.iobuf(self.in_shape, shared=self.prev_layer.deltas,
                                         parallelism=self.parallelism)
         else:
-            self.deltas = self.be.iobuf(self.in_shape, shared=delta_buffers[0],
+            self.deltas = self.be.iobuf(self.in_shape, shared=bottom_buffer,
                                         parallelism=self.parallelism)
-            delta_buffers.reverse()
+            delta_buffers.buffers.reverse()
 
     def get_terminal(self):
         """
@@ -721,6 +815,10 @@ class MergeMultistream(MergeBroadcast):
     def __init__(self, layers, merge, name=None):
         super(MergeMultistream, self).__init__(layers, merge=merge, name=name)
 
+    @property
+    def nest_deltas(self):
+        return False
+
     def configure(self, in_obj):
         """
         Must receive a list of shapes for configuration (one for each pathway)
@@ -749,6 +847,8 @@ class MergeMultistream(MergeBroadcast):
         Arguments:
             delta_buffers (list): list of pre-allocated tensors (provided by layer container)
         """
+        # delta_buffers ignored here, will generate
+        # new delta buffers for each sequential container
         for l in self.layers:
             l.allocate_deltas()
 
@@ -900,6 +1000,17 @@ class RoiPooling(Sequential):
         self.outputs = self.be.iobuf(self.out_shape, shared=shared_outputs)
         self.max_idx = self.be.iobuf(self.out_shape, dtype=np.int32)
 
+    def allocate_deltas(self, global_deltas=None):
+        if global_deltas is None:
+            self.global_deltas = DeltasTree()
+
+            st_ind = 0 if getattr(self.layers[0], 'nest_deltas', False) else 1
+            for layer in self.layers[st_ind:]:
+                layer.allocate_deltas(self.global_deltas)
+
+            self.global_deltas.allocate_buffers()
+        super(RoiPooling, self).set_deltas(self.global_deltas)
+
     def set_deltas(self, delta_buffers):
         """
         Use pre-allocated (by layer containers) list of buffers for backpropagated error.
@@ -987,6 +1098,366 @@ class RoiPooling(Sequential):
         return terminals
 
 
+class Encoder(Sequential):
+    """
+    Encoder stack for the Seq2Seq container. Acts like a sequential
+    except for bprop which are connected as specified to Decoder recurrent layers
+    """
+    def __init__(self, layers, name=None):
+        super(Encoder, self).__init__(layers, name)
+        # list of recurrent layers only:
+        self._recurrent = [l for l in self.layers if isinstance(l, Recurrent)]
+        self.connections = None
+        self.error_buf = None
+        self.error_slices = None
+
+    def allocate_deltas(self, global_deltas=None):
+        super(Encoder, self).allocate_deltas(global_deltas=global_deltas)
+
+        self.error_buf = self.be.iobuf(self.out_shape)
+        self.error_slices = get_steps(self.error_buf, self.out_shape)
+
+    def set_connections(self, decoder_cons):
+        """
+        Based on decoder connections, create the list of which layers encoder are
+        connected to.
+        """
+        cons = []
+        for ii in range(len(self._recurrent)):
+            l_list = [i_dec for i_dec, i_enc in enumerate(decoder_cons) if i_enc == ii]
+            cons.append(l_list)
+        self.connections = cons
+
+    def get_final_states(self, decoder_cons):
+        """
+        Based on decoder connections, prepare the list of final states for decoder
+        """
+        final_states = [self._recurrent[ii].final_state()
+                        if ii is not None else None
+                        for ii in decoder_cons]
+
+        return final_states
+
+    def bprop(self, hidden_error_list, inference=False, alpha=1.0, beta=0.0):
+        """
+        Arguments:
+            hidden_error_list: Decoder container bprop output. List of errors
+                               associated with decoder recurrent layers.
+        """
+        i_enc = len(self._recurrent) - 1  # index into recurrent layers, in reverse order
+
+        # initialize error to zeros (shape of last encoder layer output)
+        error = self.error_buf
+        error.fill(0)
+
+        # bprop through layers, setting up connections from decoder layers for recurrent layers
+        for l in reversed(self._layers):
+            altered_tensor = l.be.distribute_data(error, l.parallelism)
+            if altered_tensor:
+                l.revert_list.append(altered_tensor)
+
+            # add the hidden error by the hidden error list
+            if isinstance(l, Recurrent):
+                for i_dec in self.connections[i_enc]:
+                    self.error_slices[-1][:] = self.error_slices[-1] + hidden_error_list[i_dec]
+                i_enc -= 1
+
+            # normal bprop through the layers
+            if type(l.prev_layer) is BranchNode or l is self._layers[0]:
+                error = l.bprop(error, alpha, beta)
+            else:
+                error = l.bprop(error)
+
+            for tensor in l.revert_list:
+                self.be.revert_tensor(tensor)
+
+
+class Decoder(Sequential):
+    """
+    Decoder stack for the Seq2Seq container. Acts like a sequential
+    except for fprop which takes the additional init_state_list, and bprop
+    which takes additional hidden_delta
+    """
+    def __init__(self, layers, name=None):
+        super(Decoder, self).__init__(layers, name)
+        # list of recurrent layers only:
+        self._recurrent = [l for l in self.layers if isinstance(l, Recurrent)]
+        self.connections = None
+        self.full_steps = None
+
+    def fprop(self, x, inference=False, init_state_list=None):
+
+        if init_state_list is None:
+            init_state_list = [None for _ in range(len(self._recurrent))]
+
+        ii = 0  # index into init_state_list (decoder recurrent layer number)
+        for l in self.layers:
+            altered_tensor = l.be.distribute_data(x, l.parallelism)
+            l.revert_list = [altered_tensor] if altered_tensor else []
+
+            # special fprop for recurrent layers with init state
+            if isinstance(l, Recurrent):
+                x = l.fprop(x, inference=inference, init_state=init_state_list[ii])
+                ii = ii + 1
+            else:
+                x = l.fprop(x, inference=inference)
+
+        return x
+
+    def set_connections(self, decoder_cons):
+        self.connections = decoder_cons
+
+    def bprop(self, error, inference=False, alpha=1.0, beta=0.0):
+        """
+        bprop through layers, saving hidden_error for Recurrent layers
+        """
+        hidden_error_list = []
+        for l in reversed(self.layers):
+            altered_tensor = l.be.distribute_data(error, l.parallelism)
+            if altered_tensor:
+                l.revert_list.append(altered_tensor)
+
+            error = l.bprop(error)
+            if isinstance(l, Recurrent):
+                hidden_error_list.append(l.get_final_hidden_error())
+
+            for tensor in l.revert_list:
+                self.be.revert_tensor(tensor)
+
+        # return hidden error in order of decoder layers
+        # (to match decoder_connections)
+        hidden_error_list.reverse()
+
+        return hidden_error_list
+
+    def switch_mode(self, inference):
+        """
+        Dynamically grow or shrink the number of time steps to perform
+        single time step fprop during inference.
+        """
+        # set up parameters
+        hasLUT = isinstance(self.layers[0], LookupTable)
+        # sequence length is different dimension depending on whether there is LUT
+        cur_steps = self.in_shape[0] if hasLUT else self.in_shape[1]
+        if not inference:
+            old_size = cur_steps
+            # assumes encoder and decoder have the same sequence length
+            new_size = self.full_steps
+        else:
+            old_size = cur_steps
+            new_size = 1
+
+        # resize buffers
+        if old_size != new_size:
+            if hasLUT:
+                in_obj = (new_size, 1)
+            else:
+                in_obj = (self.out_shape[0], new_size)
+            self.configure(in_obj=in_obj)
+            # set layer outputs to None so they get reallocated
+            for l in self.layers:
+                if l.owns_output:
+                    l.outputs = None
+            self.allocate(shared_outputs=None)  # re-allocate deltas, but not weights
+            for l in self.layers:
+                l.name += "'"
+
+
+class Seq2Seq(LayerContainer):
+    """
+    Layer container that encapsulates encoder decoder pathways
+    used for sequence to sequence models.
+
+    Arguments:
+        layers (list): Length two list specifying the encoder and decoder.
+                       The encoder must be provided as the first list element.
+                       List elements may be an Encoder and a Decoder container, or,
+                       similar to Tree and Broadcast containers, encoder (decoder) can be
+                       specified as a list of layers or a single layer, which are
+                       converted to Encoder and Decoder containers.
+        decoder_connections (list of ints): for every recurrent decoder layer, specifies the
+                                         corresponding encoder layer index (recurrent layers only)
+                                         to get initial state from. The format will be, e.g.
+                                         [0, 1, None].
+                                         If not given, the container will try to make a
+                                         one-to-one connections, which assumes an equal number
+                                         of encoder and decoder recurrent layers.
+    """
+    def __init__(self, layers, decoder_connections=None, name=None):
+
+        assert len(layers) == 2, self.__class__.__name__ + " layers argument must be length 2 list"
+
+        super(Seq2Seq, self).__init__(name=name)
+
+        def get_container(l, cls):
+            if isinstance(l, cls):
+                return l
+            elif isinstance(l, list):
+                return cls(l)
+            elif isinstance(l, Layer):
+                return cls([l])
+            else:
+                ValueError("Incompatible element for " + self.__class__.__name__ + " container")
+
+        self.encoder = get_container(layers[0], Encoder)
+        self.decoder = get_container(layers[1], Decoder)
+        self.layers = self.encoder.layers + self.decoder.layers
+
+        self.hasLUT = isinstance(self.encoder.layers[0], LookupTable)
+
+        if decoder_connections:
+            self.decoder_connections = decoder_connections
+        else:
+            # if decoder_connections not given, assume one to one connections between
+            # an equal number of encoder and decoder recurrent layers
+            assert len(self.encoder._recurrent) == len(self.decoder._recurrent)
+            self.decoder_connections = np.arange(len(self.encoder._recurrent)).tolist()
+
+        self.encoder.set_connections(self.decoder_connections)
+        self.decoder.set_connections(self.decoder_connections)
+
+    @classmethod
+    def gen_class(cls, pdict):
+        layers = [[], []]
+        for i, layer in enumerate(pdict['layers']):
+            typ = layer['type']
+            ccls = load_class(typ)
+
+            if i < pdict['num_encoder_layers']:
+                layers[0].append(ccls.gen_class(layer['config']))
+            else:
+                layers[1].append(ccls.gen_class(layer['config']))
+
+        # layers is special in that there may be parameters
+        # serialized which will be used elsewhere
+        lsave = pdict.pop('layers')
+        pdict.pop('num_encoder_layers', None)
+        new_cls = cls(layers=layers, **pdict)
+        pdict['layers'] = lsave
+        return new_cls
+
+    def get_description(self, get_weights=False, keep_states=False):
+        """
+        Get layer parameters. All parameters are needed for optimization, but
+        only weights are serialized.
+
+        Arguments:
+            get_weights (bool, optional): Control whether all parameters are returned or
+                                          just weights for serialization.
+            keep_states (bool, optional): Control whether all parameters are returned
+                                          or just weights for serialization.
+        """
+        desc = super(Seq2Seq, self).get_description(get_weights=get_weights,
+                                                    keep_states=keep_states)
+
+        desc['config']['num_encoder_layers'] = len(self.encoder.layers)
+        desc['config']['decoder_connections'] = self.decoder_connections
+        self._desc = desc
+        return desc
+
+    def configure(self, in_obj):
+        # assumes Seq2Seq will always get dataset as in_obj
+        self.encoder.configure(in_obj.shape)
+        self.decoder.configure(in_obj.decoder_shape)
+
+        self.parallelism = self.decoder.parallelism
+        self.out_shape = self.decoder.out_shape
+        self.in_shape = self.decoder.layers[-1].in_shape if self.hasLUT else self.decoder.in_shape
+        # save full sequence length for switching between inference and non-inference modes
+        self.decoder.full_steps = self.in_shape[1]
+        return self
+
+    def allocate(self, shared_outputs=None):
+        self.decoder.allocate(shared_outputs)
+        if any([l.owns_output for l in self.decoder.layers]):
+            self.encoder.allocate()
+        else:
+            self.encoder.allocate(shared_outputs)
+        # buffer for collecting time loop outputs
+        self.xbuf = self.be.iobuf(self.out_shape)
+
+    def allocate_deltas(self, global_deltas=None):
+        self.encoder.allocate_deltas(global_deltas)
+        self.decoder.allocate_deltas(global_deltas)
+
+    def fprop(self, inputs, inference=False, beta=0.0):
+        """
+        Forward propagation for sequence to sequence container. Calls
+        fprop for the Encoder container followed by fprop for the Decoder
+        container. If inference is True, the Decoder will be called with
+        individual time steps in a for loop.
+        """
+        # make sure we are in the correct decoder mode
+        self.decoder.switch_mode(inference)
+
+        if not inference:
+            # load data
+            (x, z) = inputs
+
+            # fprop through Encoder layers
+            x = self.encoder.fprop(x, inference=inference, beta=0.0)
+
+            # get encoder hidden state
+            init_state_list = self.encoder.get_final_states(self.decoder_connections)
+
+            # fprop through Decoder layers
+            x = self.decoder.fprop(z, inference=inference, init_state_list=init_state_list)
+        else:  # Loopy inference
+
+            # prep data
+            x = inputs
+            new_steps = 1
+            if self.hasLUT:
+                z_shape = new_steps
+            else:
+                z_shape = (self.out_shape[0], new_steps)
+            z = x.backend.iobuf(z_shape)
+
+            # encoder
+            x = self.encoder.fprop(x, inference=inference, beta=0.0)
+
+            # get encoder hidden state
+            init_state_list = self.encoder.get_final_states(self.decoder_connections)
+
+            # decoder
+            steps = self.in_shape[1]
+            if self.hasLUT:
+                z_argmax = x.backend.zeros((1, z.shape[0]*z.shape[1]))
+
+            for t in range(steps):
+                z = self.decoder.fprop(z, inference=inference, init_state_list=init_state_list)
+
+                # transfer hidden state from DECODER to next step
+                init_state_list = [recurrent.final_state()
+                                   for recurrent in self.decoder._recurrent]
+
+                # and write to output buffer
+                self.xbuf[:, t*self.be.bsz:(t+1)*self.be.bsz] = z
+
+                # handle input to LUT
+                if self.hasLUT:
+                    z_argmax[:] = self.be.argmax(z, axis=0)
+                    z = z_argmax
+
+            x = self.xbuf
+
+        if inference:
+            self.revert_tensors()
+
+        return x
+
+    def bprop(self, error, inference=False, alpha=1.0, beta=0.0):
+        """
+        Backpropagation for sequence to sequence container. Calls Decoder container
+        bprop followed by Encoder container bprop.
+        """
+
+        hidden_error_list = self.decoder.bprop(error)
+        self.encoder.bprop(hidden_error_list)
+
+        return self.encoder.layers[0].deltas
+
+
 class Multicost(NervanaObject):
     """
     Class used to compute cost from a Tree container with multiple outputs.
@@ -1003,19 +1474,9 @@ class Multicost(NervanaObject):
         super(Multicost, self).__init__(name)
         self.costs = costs
         self.weights = [1.0 for c in costs] if weights is None else weights
-        self.errors = None
+        self.deltas = None
         self.inputs = None
         self.costfunc = costs[0].costfunc  # For displaying during callbacks
-
-    @classmethod
-    def gen_class(cls, pdict):
-        costs = []
-        for cost in pdict['costs']:
-            typ = cost['type']
-            ccls = load_class(typ)
-            costs.append(ccls.gen_class(cost['config']))
-        pdict['costs'] = costs
-        return cls(**pdict)
 
     def initialize(self, in_obj):
         """
@@ -1024,8 +1485,13 @@ class Multicost(NervanaObject):
         Arguments:
             in_obj (Layer): input layer from which to calculate costs
         """
-        assert hasattr(in_obj, 'layers'), "MultiCost must be passed a layer container"
-        terminals = in_obj.get_terminal()
+        if isinstance(in_obj, LayerContainer):
+            terminals = in_obj.get_terminal()
+        elif isinstance(in_obj, list):
+            terminals = in_obj
+        else:
+            raise RuntimeError("Multicost must be passed a container or list")
+
         for c, ll in zip(self.costs, terminals):
             c.initialize(ll)
 
@@ -1091,12 +1557,16 @@ class Multicost(NervanaObject):
         Returns:
             list of Tensors containing errors for each input
         """
-
         l_targets = targets if type(targets) in (tuple, list) else [targets for c in self.costs]
-        if self.errors is None:
-            self.errors = [c.deltas for c in self.costs]
+        for cost, i, t, we in zip(self.costs, inputs, l_targets, self.weights):
+            cost.get_errors(i, t)
+            if isinstance(cost.deltas, list):
+                for delta in cost.deltas:
+                    delta[:] *= we
+            else:
+                cost.deltas[:] *= we
 
-        for c, i, t in zip(self.costs, inputs, l_targets):
-            c.get_errors(i, t)
+        if self.deltas is None:
+            self.deltas = [c.deltas for c in self.costs]
 
-        return self.errors
+        return self.deltas

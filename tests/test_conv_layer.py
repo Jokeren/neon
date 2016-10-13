@@ -19,10 +19,15 @@ import itertools as itt
 import numpy as np
 import pytest
 from neon import NervanaObject
-from neon.backends.nervanagpu import NervanaGPU
 from neon.layers.layer import Convolution
 from neon.initializers.initializer import Uniform
 from utils import allclose_with_out
+try:
+    from neon.backends.nervanagpu import NervanaGPU
+except:
+    # stub out the class
+    class NervanaGPU(object):
+        pass
 
 
 def pytest_generate_tests(metafunc):
@@ -105,7 +110,7 @@ def pytest_generate_tests(metafunc):
         metafunc.parametrize('rand_convargs', fargs)
 
 
-def test_conv_zeros(backend_default, zeros_convargs):
+def test_conv_zeros(backend_default, zeros_convargs, deltas_buffer):
     fshape, nofm, batch_size = zeros_convargs
 
     NervanaObject.be.bsz = batch_size
@@ -121,7 +126,11 @@ def test_conv_zeros(backend_default, zeros_convargs):
     neon_layer.configure(inshape)
     neon_layer.prev_layer = True
     neon_layer.allocate()
-    neon_layer.set_deltas([neon_layer.be.iobuf(inshape)])
+
+    neon_layer.allocate_deltas(deltas_buffer)
+    deltas_buffer.allocate_buffers()
+    neon_layer.set_deltas(deltas_buffer)
+
     out = neon_layer.fprop(inp).get()
     assert np.min(out) == 0.0 and np.max(out) == 0.0
 
@@ -134,8 +143,7 @@ def test_conv_zeros(backend_default, zeros_convargs):
     return
 
 
-def test_conv_ones(backend_default, ones_convargs):
-
+def test_conv_ones(backend_default, ones_convargs, deltas_buffer):
     dtypeu = np.float32
     indim, nifm, fshape, nofm, batch_size, stride, pad = ones_convargs
     if isinstance(NervanaObject.be, NervanaGPU) and NervanaObject.be.compute_capability < (5, 0):
@@ -157,7 +165,11 @@ def test_conv_ones(backend_default, ones_convargs):
     neon_layer.configure(inshape)
     neon_layer.prev_layer = True
     neon_layer.allocate()
-    neon_layer.set_deltas([neon_layer.be.iobuf(inshape)])
+
+    neon_layer.allocate_deltas(deltas_buffer)
+    deltas_buffer.allocate_buffers()
+    neon_layer.set_deltas(deltas_buffer)
+
     # run fprop
     out = neon_layer.fprop(inp).get()
 
@@ -204,7 +216,7 @@ def test_conv_ones(backend_default, ones_convargs):
     return
 
 
-def test_conv_rand(backend_default, rand_convargs):
+def test_conv_rand(backend_default, rand_convargs, deltas_buffer):
 
     indim, nifm, fshape, nofm, batch_size, stride, rng_max, w_rng, pad = rand_convargs
     if isinstance(NervanaObject.be, NervanaGPU) and NervanaObject.be.compute_capability < (5, 0):
@@ -246,7 +258,11 @@ def test_conv_rand(backend_default, rand_convargs):
     neon_layer.configure(inshape)
     neon_layer.prev_layer = True
     neon_layer.allocate()
-    neon_layer.set_deltas([neon_layer.be.iobuf(inshape)])
+
+    neon_layer.allocate_deltas(deltas_buffer)
+    deltas_buffer.allocate_buffers()
+    neon_layer.set_deltas(deltas_buffer)
+
     neon_out = neon_layer.fprop(inp).get()
 
     # pull neon weights into ref layer weights
@@ -344,7 +360,7 @@ class ConvLayerRef(object):
         self.z = np.zeros((mbs, self.nout), dtype=dtypeu)
         self.y = np.zeros((mbs, self.nout), dtype=dtypeu)
         ofmstarts = np.array(list(range(0, (self.ofmsize * nofm), self.ofmsize)))
-        self.ofmlocs = np.zeros((self.ofmsize, nofm), dtype='i32')
+        self.ofmlocs = np.zeros((self.ofmsize, nofm), dtype=np.int32)
         for dst in range(self.ofmsize):
             self.ofmlocs[dst, :] = ofmstarts + dst
         # Figure out the connections with the previous layer.

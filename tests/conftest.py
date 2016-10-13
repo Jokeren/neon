@@ -22,6 +22,7 @@ import re
 
 from neon.backends import gen_backend
 from neon.backends.nervanacpu import NervanaCPU
+from neon.layers.container import DeltasTree
 
 
 def pytest_addoption(parser):
@@ -69,7 +70,7 @@ def backend_default(request):
 
     # add a cleanup call - will run after all test in module are done
     def cleanup():
-        be = request.getfuncargvalue('backend_default')
+        be = request.getfixturevalue('backend_default')
         del be
     request.addfinalizer(cleanup)
 
@@ -91,7 +92,7 @@ def backend_gpu(request):
 
     # add a cleanup call - will run after all test in module are done
     def cleanup():
-        be = request.getfuncargvalue('backend_gpu')
+        be = request.getfixturevalue('backend_gpu')
         del be
     request.addfinalizer(cleanup)
 
@@ -111,7 +112,7 @@ def backend_cpu(request):
 
     # add a cleanup call - will run after all tests in module are done
     def cleanup():
-        be = request.getfuncargvalue('backend_cpu')
+        be = request.getfixturevalue('backend_cpu')
         del be
     request.addfinalizer(cleanup)
 
@@ -131,7 +132,7 @@ def backend_cpu64(request):
 
     # add a cleanup call - will run after all tests in module are done
     def cleanup():
-        be = request.getfuncargvalue('backend_cpu64')
+        be = request.getfixturevalue('backend_cpu64')
         del be
     request.addfinalizer(cleanup)
 
@@ -164,7 +165,7 @@ def backend_tests(request):
 
     # add a cleanup call - will run after all tests in module are done
     def cleanup():
-        be = request.getfuncargvalue('backend_tests')
+        be = request.getfixturevalue('backend_tests')
         del be
     request.addfinalizer(cleanup)
 
@@ -185,7 +186,7 @@ def backend_pair(request):
     ng, nc = get_backend_pair(device_id=request.config.getoption("--device_id"))
 
     def cleanup():
-        ng, nc = request.getfuncargvalue('backend_pair')
+        ng, nc = request.getfixturevalue('backend_pair')
         del ng
         del nc
     request.addfinalizer(cleanup)
@@ -198,7 +199,7 @@ def backend_pair_bench(request):
     ng, nc = get_backend_pair(device_id=request.config.getoption("--device_id"), bench=True)
 
     def cleanup():
-        ng, nc = request.getfuncargvalue('backend_pair_bench')
+        ng, nc = request.getfixturevalue('backend_pair_bench')
         del ng
         del nc
     request.addfinalizer(cleanup)
@@ -212,9 +213,25 @@ def backend_pair_dtype(request):
                               device_id=request.config.getoption("--device_id"))
 
     def cleanup():
-        ng, nc = request.getfuncargvalue('backend_pair_dtype')
+        ng, nc = request.getfixturevalue('backend_pair_dtype')
         del ng
         del nc
     request.addfinalizer(cleanup)
 
     return (ng, nc)
+
+
+@pytest.fixture
+def deltas_buffer():
+    # empty DeltasTree object for tests that need
+    # to allocate shared deltas buffers
+    return DeltasTree()
+
+
+@pytest.fixture
+def deltas_buffer_wref():
+    # returns 2 empty DeltasTree object for
+    # tests that need to allocate shared
+    # deltas buffers for 2 models
+    # (one test, one reference)
+    return (DeltasTree(), DeltasTree())

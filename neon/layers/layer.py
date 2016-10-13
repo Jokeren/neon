@@ -20,7 +20,6 @@ import numpy as np
 from neon import NervanaObject
 from neon.backends import Autodiff
 from neon.backends.backend import Tensor
-from neon.util.persist import load_class
 
 
 logger = logging.getLogger(__name__)
@@ -129,6 +128,9 @@ class Layer(NervanaObject):
             self.outputs = self.be.iobuf(self.out_shape, shared=shared_outputs,
                                          parallelism=self.parallelism)
 
+    def allocate_deltas(self, global_deltas):
+        global_deltas.proc_layer(self)
+
     def set_deltas(self, delta_buffers):
         """
         Use pre-allocated (by layer containers) list of buffers for backpropagated error.
@@ -137,7 +139,7 @@ class Layer(NervanaObject):
         so do not own their deltas).
 
         Arguments:
-            delta_buffers (list): list of pre-allocated tensors (provided by layer container)
+            delta_buffers (DeltasTree): list of pre-allocated tensors (provided by layer container)
         """
         if self.next_layer is not None and self.next_layer.parallelism != self.parallelism:
             self.owns_delta = True
@@ -146,9 +148,9 @@ class Layer(NervanaObject):
             if type(self.prev_layer) in (BranchNode,):
                 self.deltas = self.prev_layer.deltas
             else:
-                self.deltas = self.be.iobuf(self.in_shape, shared=delta_buffers[0],
+                self.deltas = self.be.iobuf(self.in_shape, shared=delta_buffers.buffers[0],
                                             parallelism=self.parallelism)
-                delta_buffers.reverse()
+                delta_buffers.buffers.reverse()
         else:
             self.deltas = None
 
@@ -330,11 +332,11 @@ class BranchNode(Layer):
         so do not own their deltas).
 
         Arguments:
-            delta_buffers (list): list of pre-allocated tensors (provided by layer container)
+            delta_buffers (DeltasTree): list of pre-allocated tensors (provided by layer container)
         """
         if self.deltas is None:
-            self.deltas = self.be.iobuf(self.in_shape, shared=delta_buffers[0])
-            delta_buffers.reverse()
+            self.deltas = self.be.iobuf(self.in_shape, shared=delta_buffers.buffers[0])
+            delta_buffers.buffers.reverse()
 
     def bprop(self, error, alpha=1.0, beta=0.0):
         """
@@ -542,6 +544,7 @@ class Pooling(Layer):
         Returns:
             Tensor: deltas to propagate to the adjacent lower layer
         """
+
         self.be.bprop_pool(self.nglayer, error, self.deltas, self.argmax, alpha, beta)
         return self.deltas
 
@@ -571,15 +574,6 @@ class ParameterLayer(Layer):
         self.batch_sum_shape = None
         self.states = []
         self.owns_delta = True
-
-    @classmethod
-    def gen_class(cls, pdict):
-        if 'init' in pdict and pdict['init'] is not None:
-            cname = pdict['init']['type']
-            icls = load_class(cname)
-            init = icls(**pdict['init']['config'])
-            pdict['init'] = init
-        return cls(**pdict)
 
     def allocate(self, shared_outputs=None):
         """
@@ -1175,18 +1169,6 @@ class Activation(Layer):
         return "Activation Layer '%s': %s" % (
                self.name, self.transform.__class__.__name__)
 
-    @classmethod
-    def gen_class(cls, pdict):
-        assert 'transform' in pdict
-        cname = pdict['transform']['type']
-        tcls = load_class(cname)
-        # many activations have no args
-        if 'config' not in pdict['transform']:
-            pdict['transform']['config'] = {}
-        transf = tcls(**pdict['transform']['config'])
-        pdict['transform'] = transf
-        return cls(**pdict)
-
     def configure(self, in_obj):
         """
         Sets shape based parameters of this layer given an input tuple or int
@@ -1233,6 +1215,102 @@ class Activation(Layer):
         return self.deltas
 
 
+class Reshape(Layer):
+
+    """
+    A layer that reshape the input
+
+    Arguments:
+        reshape: (tuple(int)): multi-dimensional shape of how to reshape the input.
+
+        It can contain 0, which will be replaced by the size on that dimension
+        from inputs.
+
+        It can contain -1, which will be configured to match the total
+        size of the tensor.
+
+        The length of the reshape can be smaller or bigger than the input shape.
+
+        The batch size dimension is implicit.The shape interpretation is consistent
+        with rest of neon. If reshape to 2D, it will assume the 2nd dimension is
+        time and combine it with backend batch size. If reshape to 3D, it will
+        assume to be (C, H, W) dimensions and add batch size dimension in the end.
+    """
+
+    def __init__(self, reshape, name=None):
+        super(Reshape, self).__init__(name)
+        if isinstance(reshape, int):
+            reshape = (reshape,)
+        self.reshape = reshape
+        self.owns_output = False
+
+    def __str__(self):
+        return "Reshape Layer '%s' input shape %s to %s" % (self.name, self.in_shape, self.reshape)
+
+    def configure(self, in_obj):
+        """
+        Configure the output shape based on input shape and reshape shape.
+        The function replaces 0 and -1 and add the batch size dimension.
+        """
+        super(Reshape, self).configure(in_obj)
+        if isinstance(self.in_shape, tuple):
+            if len(self.in_shape) == 2:
+                self.in_shape_t = (
+                    self.in_shape[0], self.in_shape[1] * self.be.bsz)
+            else:
+                self.in_shape_t = (int(np.prod(self.in_shape)), self.be.bsz)
+        else:
+            self.in_shape_t = (self.in_shape, self.be.bsz)
+
+        self.out_shape = list(self.reshape)
+
+        if 0 in self.reshape:
+            dim_to_keep = np.where(np.array(self.reshape) == 0)[0]
+            self.out_shape[dim_to_keep] = list(self.in_shape)[dim_to_keep]
+
+        if -1 in self.reshape:
+            missing_dim = -int(np.prod(self.in_shape)) // int(np.prod(self.out_shape))
+            self.out_shape = [missing_dim if x == -1 else x for x in self.out_shape]
+
+        self.out_shape = tuple(self.out_shape)
+
+        if len(self.out_shape) == 2:
+            self.out_shape_t = (
+                self.out_shape[0], self.out_shape[1] * self.be.bsz)
+        else:
+            self.out_shape_t = (int(np.prod(self.out_shape)), self.be.bsz)
+
+        assert np.prod(self.out_shape) == np.prod(self.in_shape)
+        return self
+
+    def fprop(self, inputs, inference=False):
+        """
+        In cases that inputs from previous layer are contiguous tensor, the layer
+        creates a reshaped view.
+        In cases that they are non-contiguous, the layer does a copy of the data
+        and then creates a reshaped view.
+        """
+        if inputs.is_contiguous is False:
+            if self.inputs is None:
+                self.inputs = self.be.empty_like(inputs)
+                self.outputs = self.inputs.reshape(self.out_shape_t)
+            self.inputs.copy(inputs)
+        else:
+            if self.inputs is None or self.inputs is not inputs:
+                self.inputs = inputs
+                self.outputs = self.inputs.reshape(self.out_shape_t)
+
+        return self.outputs
+
+    def bprop(self, error):
+        """
+        Backward propagation reshapes the error inputs for previous layer.
+        """
+        if self.deltas is None:
+            self.deltas = error.reshape(self.in_shape_t)
+        return self.deltas
+
+
 class DataTransform(Layer):
 
     """
@@ -1253,14 +1331,6 @@ class DataTransform(Layer):
     def __str__(self):
         return "DataTransform Layer '%s': %s" % (
                self.name, self.transform.__class__.__name__)
-
-    @classmethod
-    def gen_class(cls, pdict):
-        if pdict.get('transform') is not None:
-            icls = load_class(pdict['transform']['type'])
-            transform = icls(**pdict['transform']['config'])
-            pdict['transform'] = transform
-        return cls(**pdict)
 
     def configure(self, in_obj):
         """
@@ -1319,17 +1389,6 @@ class CompoundLayer(list):
         self.batch_norm = batch_norm
         self.bias = bias
         self.base_name = name
-
-    @classmethod
-    def gen_class(cls, pdict):
-        for key in ['init', 'bias', 'activation']:
-            if key in pdict and pdict[key] is not None:
-                cname = pdict[key]['type']
-                icls = load_class(cname)
-                if 'config' not in pdict[key]:
-                    pdict[key]['config'] = {}
-                pdict[key] = icls(**pdict[key]['config'])
-        return cls(**pdict)
 
     def init_base_name(self):
         if self.base_name is None:
@@ -1811,15 +1870,6 @@ class GeneralizedCost(NervanaObject):
         self.deltas = None
         self.cost_buffer = self.be.empty((1, 1))
 
-    @classmethod
-    def gen_class(cls, pdict):
-        typ = pdict['costfunc']['type']
-        ccls = load_class(typ)
-        if 'config' not in pdict['costfunc']:
-            pdict['costfunc']['config'] = {}
-        pdict['costfunc'] = ccls.gen_class(pdict['costfunc']['config'])
-        return cls(**pdict)
-
     def initialize(self, in_obj):
         """
         Determine dimensions of cost and error buffers and allocate space from the input layer
@@ -1885,6 +1935,9 @@ class GeneralizedCostMask(GeneralizedCost):
     Arguments:
        costfunc (Cost): class with costfunc that computes errors
     """
+    def __init__(self, costfunc, weights=1.0, name=None):
+        super(GeneralizedCostMask, self).__init__(costfunc, name)
+        self.weights = weights
 
     def get_cost(self, inputs, targets_mask):
         """
@@ -1900,9 +1953,10 @@ class GeneralizedCostMask(GeneralizedCost):
         """
         targets, mask = targets_mask
         masked_input = inputs * mask
-        self.outputs[:] = self.costfunc(masked_input, targets)
-        self.cost_buffer[:] = self.be.mean(self.outputs, axis=1)
-        self.cost = self.cost_buffer.get()
+        masked_targets = targets * mask
+        self.outputs[:] = self.costfunc(masked_input, masked_targets)
+        self.cost_buffer[:] = self.be.mean(self.outputs, axis=1) * self.weights
+        self.cost[:] = self.cost_buffer.get()
         return self.cost
 
     def get_errors(self, inputs, targets_mask):
@@ -1920,7 +1974,7 @@ class GeneralizedCostMask(GeneralizedCost):
             deltas.
         """
         targets, mask = targets_mask
-        self.deltas[:] = self.costfunc.bprop(inputs, targets) * mask
+        self.deltas[:] = self.costfunc.bprop(inputs, targets) * mask * self.weights
         return self.deltas
 
 

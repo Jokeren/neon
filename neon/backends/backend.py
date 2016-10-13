@@ -576,7 +576,7 @@ class Backend(AbstractBackend):
             if (len(dim0) == 2):
                 bufshape = (dim0[0], dim0[1] * self.bsz)
             else:
-                bufshape = (np.prod(dim0), self.bsz)
+                bufshape = (int(np.prod(dim0)), self.bsz)
         else:
             bufshape = (dim0, self.bsz)
 
@@ -602,7 +602,7 @@ class Backend(AbstractBackend):
             int: Size of required iobuf
         """
         num_dev = 1 if parallelism in ('Data', 'Model') else getattr(self, 'num_dev', 1)
-        return num_dev * np.prod(shape)
+        return num_dev * int(np.prod(shape))
 
     def distribute_data(self, tensor, layer_parallelism):
         """
@@ -1504,6 +1504,8 @@ class Backend(AbstractBackend):
         """
         if axis not in (0, 1):
             raise ValueError("bad axis for onehot")
+        assert (indices.dtype is np.dtype(np.int32)), "onehot indices should be int32, got " + \
+            str(indices.dtype)
         return OpTreeNode.build("onehot", None, None, idx=indices, axis=axis, out=out)
 
     def update_fc_bias(self, err, out):

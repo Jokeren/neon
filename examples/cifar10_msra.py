@@ -70,10 +70,11 @@ def extract_images(out_dir, padded_size):
     Save CIFAR-10 dataset as PNG files
     '''
     import numpy as np
-    from neon.data import load_cifar10
+    from neon.data import CIFAR10
     from PIL import Image
     dataset = dict()
-    dataset['train'], dataset['val'], _ = load_cifar10(out_dir, normalize=False)
+    cifar10 = CIFAR10(path=out_dir, normalize=False)
+    dataset['train'], dataset['val'], _ = cifar10.load_data()
     pad_size = (padded_size - 32) // 2 if padded_size > 32 else 0
     pad_width = ((0, 0), (pad_size, pad_size), (pad_size, pad_size))
 
@@ -137,7 +138,7 @@ if not (os.path.exists(train_dir) and os.path.exists(test_dir)):
 
 # setup data provider
 shape = dict(channel_count=3, height=32, width=32)
-train_params = ImageParams(center=False, aspect_ratio=110, **shape)
+train_params = ImageParams(center=False, flip=True, aspect_ratio=110, **shape)
 test_params = ImageParams(**shape)
 common = dict(target_size=1, nclasses=10)
 

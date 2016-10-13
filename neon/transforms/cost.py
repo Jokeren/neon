@@ -209,20 +209,22 @@ class SmoothL1Loss(Cost):
         """
         Returns the Smooth-L1 cost
         """
-        return (0.5 * self.be.square(x) * (self.be.absolute(x) < 1) +
-                (self.be.absolute(x) - 0.5) * (self.be.absolute(x) >= 1))
+        return (0.5 * self.be.square(x) * self._sigma2 * (self.be.absolute(x) < 1/self._sigma2) +
+                (self.be.absolute(x) - 0.5/self._sigma2) * (self.be.absolute(x) >= 1/self._sigma2))
 
     def smoothL1grad(self, x):
         """
         Returns the gradient of the Smooth-L1 cost.
         """
-        return (x * (self.be.absolute(x) < 1) + self.be.sgn(x) *
-                (self.be.absolute(x) >= 1))
+        return (x * self._sigma2 * (self.be.absolute(x) < 1/self._sigma2) +
+                self.be.sgn(x) * (self.be.absolute(x) >= 1/self._sigma2))
 
-    def __init__(self):
+    def __init__(self, sigma=1.0):
         """
         Define the cost function and its gradient as lambda functions.
         """
+        self.sigma = sigma
+        self._sigma2 = self.be.square(sigma)
         self.func = lambda y, t: self.be.sum(self.smoothL1(y - t), axis=0)
         self.funcgrad = lambda y, t: self.smoothL1grad(y - t)
 
@@ -353,12 +355,12 @@ class Misclassification(Metric):
     Misclassification error metric.
     """
 
-    def __init__(self):
+    def __init__(self, steps=1):
         """
         Initialize the metric.
         """
-        self.preds = self.be.iobuf(1, persist_values=False)
-        self.hyps = self.be.iobuf(1, persist_values=False)
+        self.preds = self.be.iobuf((1, steps), persist_values=False)
+        self.hyps = self.be.iobuf((1, steps), persist_values=False)
         self.outputs = self.preds  # Contains per record metric
         self.metric_names = ['Top1Misclass']
 

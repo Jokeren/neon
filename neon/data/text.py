@@ -18,12 +18,11 @@ Defines text datatset handling.
 
 import logging
 import numpy as np
-from os.path import splitext
+import os
 
 from neon.data.dataiterator import NervanaDataIterator, ArrayIterator
 from neon.data.datasets import Dataset
 from neon.data.text_preprocessing import pad_sentences, pad_data
-
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ class Text(NervanaDataIterator):
     """
 
     def __init__(self, time_steps, path, vocab=None, tokenizer=None,
-                 onehot_input=True):
+                 onehot_input=True, autoencoder=False, conditional=False):
         """
         Construct a text dataset object.
 
@@ -44,21 +43,58 @@ class Text(NervanaDataIterator):
             vocab (python.set) : A set of unique tokens.
             tokenizer (function) : Tokenizer function.
             onehot_input (boolean): One-hot representation of input
+            autoencoder (boolean): for sequence to sequence autoencoder,
+                                   set to True to reverse target sequence.
+                                   Otherwise, target will be shifted by one.
+            conditional (boolean): for sequence to sequence models, set to
+                                   True for training data to provide correct
+                                   target from previous time step as decoder
+                                   input. If condition, shape will be a tuple
+                                   of shapes, corresponding to encoder and
+                                   decoder inputs.
         """
         super(Text, self).__init__(name=None)
-        # figure out how to remove seq_length from the dataloader
+
         self.seq_length = time_steps
         self.onehot_input = onehot_input
         self.batch_index = 0
+        self.autoencoder = autoencoder
+        self.conditional = conditional
+
+        X, y = self._get_data(path, tokenizer, vocab)
+
+        # reshape to preserve sentence continuity across batches
+        self.X = X.reshape(self.be.bsz, self.nbatches, time_steps)
+        self.y = y.reshape(self.be.bsz, self.nbatches, time_steps)
+
+        # stuff below this comment needs to be cleaned up and commented
+        self.nout = self.nclass
+        if self.onehot_input:
+            self.shape = (self.nout, time_steps)
+            self.dev_X = self.be.iobuf((self.nout, time_steps))
+            if self.conditional:
+                self.dev_Z = self.be.iobuf((self.nout, time_steps))
+        else:
+            self.shape = (time_steps, 1)
+            self.dev_X = self.be.iobuf(time_steps, dtype=np.int32)
+            if self.conditional:
+                self.dev_Z = self.be.iobuf(time_steps, dtype=np.int32)
+        self.decoder_shape = self.shape
+
+        self.dev_y = self.be.iobuf((self.nout, time_steps))
+        self.dev_lbl = self.be.iobuf(time_steps, dtype=np.int32)
+        self.dev_lblflat = self.dev_lbl.reshape((1, -1))
+
+    def _get_data(self, path, tokenizer, vocab):
 
         text = open(path).read()
         tokens = self.get_tokens(text, tokenizer)
 
         # make this a static method
-        extra_tokens = len(tokens) % (self.be.bsz * time_steps)
+        extra_tokens = len(tokens) % (self.be.bsz * self.seq_length)
         if extra_tokens:
             tokens = tokens[:-extra_tokens]
-        self.nbatches = len(tokens) // (self.be.bsz * time_steps)
+        self.nbatches = len(tokens) // (self.be.bsz * self.seq_length)
         self.ndata = self.nbatches * self.be.bsz  # no leftovers
 
         self.vocab = sorted(self.get_vocab(tokens, vocab))
@@ -70,24 +106,12 @@ class Text(NervanaDataIterator):
 
         # map tokens to indices
         X = np.asarray([self.token_to_index[t] for t in tokens], dtype=np.uint32)
-        y = np.concatenate((X[1:], X[:1]))
-
-        # reshape to preserve sentence continuity across batches
-        self.X = X.reshape(self.be.bsz, self.nbatches, time_steps)
-        self.y = y.reshape(self.be.bsz, self.nbatches, time_steps)
-
-        # stuff below this comment needs to be cleaned up and commented
-        self.nout = len(self.vocab)
-        if self.onehot_input:
-            self.shape = (self.nout, time_steps)
-            self.dev_X = self.be.iobuf((self.nout, time_steps))
+        if self.autoencoder:
+            y = X.copy()
         else:
-            self.shape = (time_steps, 1)
-            self.dev_X = self.be.iobuf(time_steps, dtype=np.int32)
+            y = np.concatenate((X[1:], X[:1]))
 
-        self.dev_y = self.be.iobuf((self.nout, time_steps))
-        self.dev_lbl = self.be.iobuf(time_steps, dtype=np.int32)
-        self.dev_lblflat = self.dev_lbl.reshape((1, -1))
+        return X, y
 
     @staticmethod
     def create_valid_file(path, valid_split=0.1):
@@ -104,7 +128,7 @@ class Text(NervanaDataIterator):
         text = open(path).read()
 
         # create train and valid paths
-        filename, ext = splitext(path)
+        filename, ext = os.path.splitext(path)
         train_path = filename + '_train' + ext
         valid_path = filename + '_valid' + ext
 
@@ -210,20 +234,34 @@ class Text(NervanaDataIterator):
         self.batch_index = 0
         while self.batch_index < self.nbatches:
             X_batch = self.X[:, self.batch_index, :].T.astype(np.float32, order='C')
-            y_batch = self.y[:, self.batch_index, :].T.astype(np.float32, order='C')
-
-            if self.onehot_input:
-                self.dev_lbl.set(X_batch)
-                self.dev_X[:] = self.be.onehot(self.dev_lblflat, axis=0)
+            if self.autoencoder is False:
+                y_batch = self.y[:, self.batch_index, :].T.astype(np.float32, order='C')
             else:
-                self.dev_X.set(X_batch)
+                # reverse target sequence
+                y_batch = self.y[:, self.batch_index, ::-1].T.astype(np.float32, order='C')
 
             self.dev_lbl.set(y_batch)
             self.dev_y[:] = self.be.onehot(self.dev_lblflat, axis=0)
 
+            if self.onehot_input:
+                self.dev_lbl.set(X_batch)
+                self.dev_X[:] = self.be.onehot(self.dev_lblflat, axis=0)
+                if self.conditional:
+                    self.dev_Z[:, self.be.bsz:] = self.dev_y[:, :-self.be.bsz]
+                    self.dev_Z[:, 0:self.be.bsz] = 0  # zero-hot, no input
+            else:
+                self.dev_X.set(X_batch)
+                if self.conditional:
+                    self.dev_lbl.set(y_batch)
+                    self.dev_Z[1:, :] = self.dev_lbl[:-1, :]
+                    self.dev_Z[0, :] = 0
+
             self.batch_index += 1
 
-            yield self.dev_X, self.dev_y
+            if self.conditional:
+                yield (self.dev_X, self.dev_Z), self.dev_y
+            else:
+                yield self.dev_X, self.dev_y
 
 
 class Shakespeare(Dataset):
@@ -245,11 +283,11 @@ class Shakespeare(Dataset):
     def gen_iterators(self):
         self.load_data()
         train_path, valid_path = Text.create_valid_file(self.filepath)
-        self.data_dict = {}
-        self.data_dict['train'] = Text(self.timesteps, train_path)
-        vocab = self.data_dict['train'].vocab
-        self.data_dict['valid'] = Text(self.timesteps, valid_path, vocab=vocab)
-        return self.data_dict
+        self._data_dict = {}
+        self._data_dict['train'] = Text(self.timesteps, train_path)
+        vocab = self._data_dict['train'].vocab
+        self._data_dict['valid'] = Text(self.timesteps, valid_path, vocab=vocab)
+        return self._data_dict
 
 
 class PTB(Dataset):
@@ -264,7 +302,9 @@ class PTB(Dataset):
     """
     def __init__(self, timesteps, path='.',
                  onehot_input=True,
-                 tokenizer=None):
+                 tokenizer=None,
+                 autoencoder=False,
+                 conditional=False):
         url = 'https://raw.githubusercontent.com/wojzaremba/lstm/master/data'
         self.filemap = {'train': 5101618,
                         'test': 449945,
@@ -284,6 +324,9 @@ class PTB(Dataset):
             self.tokenizer_func = getattr(self, self.tokenizer)
         else:
             self.tokenizer_func = None
+
+        self.autoencoder = autoencoder
+        self.conditional = conditional
 
     @staticmethod
     def newline_tokenizer(s):
@@ -326,18 +369,21 @@ class PTB(Dataset):
     def gen_iterators(self):
         self.load_data()
 
-        self.data_dict = {}
+        self._data_dict = {}
         self.vocab = None
         for phase in ['train', 'test', 'valid']:
             file_path = self.file_paths[phase]
-            self.data_dict[phase] = Text(self.timesteps,
-                                         file_path,
-                                         tokenizer=self.tokenizer_func,
-                                         onehot_input=self.onehot_input,
-                                         vocab=self.vocab)
+            conditional = self.conditional if phase is 'train' else False
+            self._data_dict[phase] = Text(self.timesteps,
+                                          file_path,
+                                          tokenizer=self.tokenizer_func,
+                                          onehot_input=self.onehot_input,
+                                          vocab=self.vocab,
+                                          autoencoder=self.autoencoder,
+                                          conditional=conditional)
             if self.vocab is None:
-                self.vocab = self.data_dict['train'].vocab
-        return self.data_dict
+                self.vocab = self._data_dict['train'].vocab
+        return self._data_dict
 
 
 class HutterPrize(Dataset):
@@ -381,7 +427,7 @@ class IMDB(Dataset):
                         sentence_length=self.sentence_length)
         (X_train, y_train), (X_test, y_test), nclass = data
 
-        self.data_dict = {'nclass': nclass}
-        self.data_dict['train'] = ArrayIterator(X_train, y_train, nclass=2)
-        self.data_dict['test'] = ArrayIterator(X_test, y_test, nclass=2)
-        return self.data_dict
+        self._data_dict = {'nclass': nclass}
+        self._data_dict['train'] = ArrayIterator(X_train, y_train, nclass=2)
+        self._data_dict['test'] = ArrayIterator(X_test, y_test, nclass=2)
+        return self._data_dict

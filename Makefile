@@ -21,6 +21,7 @@
 # Choose default Python version; overrideable with "make python2" or "make python3".
 PY := $(shell python --version 2>&1  | cut -c8)
 VIRTUALENV_DIR_BASE := .venv
+STYLEVIRTUALENV_DIR_BASE := .styleenv
 
 # get release version info
 RELEASE := $(strip $(shell grep '^VERSION *=' setup.py | cut -f 2 -d '=' \
@@ -82,7 +83,7 @@ ifeq ($(PY), 2)
 else
 	VIRTUALENV_EXE := python3 -m venv
 	PYLINT3K_ARGS :=
-	VIRTUALENV_DIR = $(VIRTUALENV_DIR_BASE)$(PY)
+	VIRTUALENV_DIR = $(VIRTUALENV_DIR_BASE)3
 	ACTIVATE = $(VIRTUALENV_DIR)/bin/activate
 endif
 
@@ -148,7 +149,7 @@ sysinstall_nodeps: $(DATA_LOADER) neon_install
 sysinstall: sysdeps $(DATA_LOADER) neon_install
 neon_install:
 	@echo "Installing neon system wide..."
-	@pip install .
+	@python setup.py install
 	@echo
 
 sysdeps:
@@ -181,7 +182,7 @@ clean_so:
 
 clean: clean_py clean_so
 	@echo "Removing virtual environment files..."
-	@rm -rf $(VIRTUALENV_DIR_BASE) $(VIRTUALENV_DIR_BASE)2 $(VIRTUALENV_DIR_BASE)3
+	@rm -rf $(VIRTUALENV_DIR_BASE) $(VIRTUALENV_DIR_BASE)2 $(VIRTUALENV_DIR_BASE)3 $(STYLEVIRTUALENV_DIR_BASE)
 	@echo
 
 test: env
@@ -211,6 +212,16 @@ coverage: env
 style: env
 	@. $(ACTIVATE); flake8 $(STYLE_CHECK_OPTS) $(STYLE_CHECK_DIRS)
 	@. $(ACTIVATE); pylint --reports=n --py3k $(PYLINT3K_ARGS) --ignore=.venv *
+	@echo
+
+# doesn't install everything, just runs flake8 and pylint on the code
+# using a style environment
+fast_style:
+	virtualenv .styleenv
+	. .styleenv/bin/activate; pip install `grep flake8 requirements.txt`
+	. .styleenv/bin/activate; pip install `grep pylint requirements.txt`
+	. .styleenv/bin/activate; flake8 $(STYLE_CHECK_OPTS) $(STYLE_CHECK_DIRS)
+	. .styleenv/bin/activate; pylint --reports=n --py3k $(PYLINT3K_ARGS) --ignore=.styleenv *
 	@echo
 
 lint: env

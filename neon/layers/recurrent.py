@@ -16,7 +16,6 @@ from __future__ import division
 from builtins import range, zip
 import numpy as np
 from neon.layers.layer import ParameterLayer, Layer
-from neon.util.persist import load_class
 
 
 def get_steps(x, shape):
@@ -77,6 +76,7 @@ class Recurrent(ParameterLayer):
 
     def __init__(self, output_size, init, init_inner=None, activation=None,
                  reset_cells=False, name=None):
+        assert activation is not None, "missing activation function for Recurrent"
         super(Recurrent, self).__init__(init, name)
         self.x = None
         self.in_deltas = None
@@ -109,7 +109,7 @@ class Recurrent(ParameterLayer):
         super(Recurrent, self).configure(in_obj)
 
         (self.nin, self.nsteps) = interpret_in_shape(self.in_shape)
-        self.in_shape = (self.nin, self.nsteps)
+        self.i_shape = (self.nin, self.nsteps)
 
         self.out_shape = (self.nout, self.nsteps)
         self.gate_shape = (self.nout * self.ngates, self.nsteps)
@@ -127,11 +127,14 @@ class Recurrent(ParameterLayer):
         """
         super(Recurrent, self).allocate(shared_outputs)
         self.h_ff_buffer = self.be.zeros_like(self.outputs)
+        self.final_state_buffer = self.be.iobuf(self.out_shape[0])
         self.h_ff = get_steps(self.h_ff_buffer, self.out_shape)
         self.h = get_steps(self.outputs, self.out_shape)
         self.h_prev = self.h[-1:] + self.h[:-1]
         # State deltas
-        self.h_delta = get_steps(self.be.iobuf(self.out_shape), self.out_shape)
+        self.h_delta_buffer = self.be.iobuf(self.out_shape)
+        self.h_delta = get_steps(self.h_delta_buffer, self.out_shape)
+        self.final_hidden_error = self.be.zeros(self.h_delta[0].shape)
         self.bufs_to_reset = [self.outputs]
 
         if self.W_input is None:
@@ -149,7 +152,7 @@ class Recurrent(ParameterLayer):
         """
         super(Recurrent, self).set_deltas(delta_buffers)
         self.out_deltas_buffer = self.deltas
-        self.out_delta = get_steps(self.out_deltas_buffer, self.in_shape)
+        self.out_delta = get_steps(self.out_deltas_buffer, self.i_shape)
 
     def init_buffers(self, inputs):
         """
@@ -169,7 +172,7 @@ class Recurrent(ParameterLayer):
                 for buf in self.bufs_to_reset:
                     buf[:] = 0
             self.x = inputs.reshape(self.nin, self.nsteps * self.be.bsz)
-            self.xs = get_steps(inputs, self.in_shape)
+            self.xs = get_steps(inputs, self.i_shape)
 
     def init_params(self, shape):
         """
@@ -184,23 +187,26 @@ class Recurrent(ParameterLayer):
         (nout, nin) = shape
         g_nout = self.ngates * nout
         doFill = False
+        weight_dim = (nout + nin + 1)
 
         if self.W is None:
-            self.W = self.be.empty((nout + nin + 1, g_nout))
+            self.W = self.be.empty((weight_dim, g_nout))
             self.dW = self.be.zeros_like(self.W)
             doFill = True
         else:
             # Deserialized weights and empty grad
-            assert self.W.shape == (nout + nin + 1, g_nout)
-            assert self.dW.shape == (nout + nin + 1, g_nout)
+            assert self.W.shape == (weight_dim, g_nout)
+            assert self.dW.shape == (weight_dim, g_nout)
 
         self.W_input = self.W[:nin].reshape((g_nout, nin))
         self.W_recur = self.W[nin:-1].reshape((g_nout, nout))
+
         self.b = self.W[-1:].reshape((g_nout, 1))
 
         if doFill:
+            wtlist = ('W_input', 'W_recur')
             gatelist = [g * nout for g in range(0, self.ngates + 1)]
-            for wtnm in ('W_input', 'W_recur'):
+            for wtnm in wtlist:
                 wtmat = getattr(self, wtnm)
                 if wtnm is 'W_recur' and self.init_inner is not None:
                     initfunc = self.init_inner
@@ -215,7 +221,7 @@ class Recurrent(ParameterLayer):
         self.dW_recur = self.dW[nin:-1].reshape(self.W_recur.shape)
         self.db = self.dW[-1:].reshape(self.b.shape)
 
-    def fprop(self, inputs, inference=False):
+    def fprop(self, inputs, inference=False, init_state=None):
         """
         Forward propagation of input to recurrent layer.
 
@@ -247,6 +253,9 @@ class Recurrent(ParameterLayer):
         # recurrent layer needs a h_prev buffer for bprop
         self.h_prev_bprop = [0] + self.h[:-1]
 
+        if init_state:
+            self.h[-1][:] = init_state
+
         # feedforward input
         self.be.compound_dot(self.W_input, self.x, self.h_ff_buffer)
 
@@ -254,6 +263,7 @@ class Recurrent(ParameterLayer):
             self.be.compound_dot(self.W_recur, h_prev, h)
             h[:] = self.activation(h + h_ff + self.b)
 
+        self.final_state_buffer[:] = self.h[-1]
         return self.outputs
 
     def bprop(self, deltas, alpha=1.0, beta=0.0):
@@ -297,22 +307,21 @@ class Recurrent(ParameterLayer):
             if out_delta:
                 self.be.compound_dot(self.W_input.T, in_deltas, out_delta, alpha=alpha, beta=beta)
 
+        self.final_hidden_error[:] = self.h_delta[0]
         return self.out_deltas_buffer
 
-    def load_weights(self, pdict, load_states=True):
+    def final_state(self):
         """
-        Load weights.
+        Return final state for sequence to sequence models
+        """
+        return self.final_state_buffer
 
-        Arguments:
-            pdict:
-            load_states:  (Default value = True)
+    def get_final_hidden_error(self):
         """
-        super(Recurrent, self).load_weights(pdict, load_states)
-        # Do this for each activation member
-        lcfg = pdict['config']
-        for _act in [x for x in self.__dict__ if 'activation' in x]:
-            _cls, _cfg = lcfg[_act]['type'], lcfg[_act]['config']
-            setattr(self, _act, load_class(_cls).gen_class(_cfg))
+        Return hidden delta after bprop and adjusting for bprop from decoder
+        to encoder in sequence to sequence models.
+        """
+        return self.final_hidden_error
 
 
 class LSTM(Recurrent):
@@ -349,6 +358,9 @@ class LSTM(Recurrent):
                  gate_activation=None, reset_cells=False, name=None):
         super(LSTM, self).__init__(output_size, init, init_inner,
                                    activation, reset_cells, name)
+        assert gate_activation is not None, ("LSTM layer requires " +
+                                             "gate_activation to be specified")
+        assert activation is not None, "missing activation function for LSTM"
         self.gate_activation = gate_activation
         self.ngates = 4  # Input, Output, Forget, Cell
 
@@ -400,7 +412,7 @@ class LSTM(Recurrent):
         self.g_delta = [gate[g1:g2] for gate in self.ifog_delta]
         self.bufs_to_reset.append(self.c_buffer)
 
-    def fprop(self, inputs, inference=False):
+    def fprop(self, inputs, inference=False, init_state=None):
         """
         Apply the forward pass transformation to the input data.  The input
             data is a list of inputs with an element for each time step of
@@ -410,6 +422,8 @@ class LSTM(Recurrent):
             inputs (Tensor): input data as 2D tensors, then being converted into a
                              list of 2D slices. The dimension is
                              (input_size, sequence_length * batch_size)
+            init_state (Tensor, optional): starting cell values, if not None.
+                                           For sequence to sequence models.
             inference (bool, optional): Set to true if you are running
                                         inference (only care about forward
                                         propagation without associated backward
@@ -424,6 +438,9 @@ class LSTM(Recurrent):
             self.h[-1][:] = 0
             self.c[-1][:] = 0
 
+        if init_state:
+            self.h[-1][:] = init_state
+
         params = (self.h, self.h_prev, self.ifog, self.ifo,
                   self.i, self.f, self.o, self.g, self.c, self.c_prev, self.c_act)
 
@@ -433,7 +450,6 @@ class LSTM(Recurrent):
             self.be.compound_dot(self.W_recur, h_prev, ifog, beta=1.0)
 
             ifog[:] = ifog + self.b
-
             ifo[:] = self.gate_activation(ifo)
             g[:] = self.activation(g)
 
@@ -441,6 +457,7 @@ class LSTM(Recurrent):
             c_act[:] = self.activation(c)
             h[:] = o * c_act
 
+        self.final_state_buffer[:] = self.h[-1]
         return self.outputs
 
     def bprop(self, deltas, alpha=1.0, beta=0.0):
@@ -509,9 +526,11 @@ class LSTM(Recurrent):
 
         # out deltas
         if self.out_deltas_buffer:  # save a bit of computation
-            self.be.compound_dot(self.W_input.T, self.ifog_delta_buffer, self.out_deltas_buffer,
+            self.be.compound_dot(self.W_input.T, self.ifog_delta_buffer,
+                                 self.out_deltas_buffer.reshape(self.nin, -1),
                                  alpha=alpha, beta=beta)
 
+        self.final_hidden_error[:] = self.h_delta[0]
         return self.out_deltas_buffer
 
 
@@ -646,7 +665,7 @@ class GRU(Recurrent):
         self.dWrz_recur = self.dW_recur[rz1:rz2]
         self.dWhcan_recur = self.dW_recur[c1:c2]
 
-    def fprop(self, inputs, inference=False):
+    def fprop(self, inputs, inference=False, init_state=None):
         """
         Apply the forward pass transformation to the input data.  The input data is a list of
             inputs with an element for each time step of model unrolling.
@@ -669,6 +688,11 @@ class GRU(Recurrent):
             self.rz[-1][:] = 0
             self.hcan[-1][:] = 0
 
+        if init_state:
+            assert init_state.shape == self.h[-1].shape, "init_state shape mismatch"
+            self.h[-1][:] = init_state
+            self.h_prev_bprop[0] = init_state
+
         self.be.compound_dot(self.W_input, self.x, self.rzhcan_buffer)
 
         for (h, h_prev, rh_prev, xs, rz, r, z, hcan, rz_rec, hcan_rec, rzhcan) in zip(
@@ -684,6 +708,7 @@ class GRU(Recurrent):
             hcan[:] = self.activation(hcan_rec + hcan + self.b_hcan)
             h[:] = (1 - z) * h_prev + z * hcan
 
+        self.final_state_buffer[:] = self.h[-1]
         return self.outputs
 
     def bprop(self, deltas, alpha=1.0, beta=0.0):
@@ -746,9 +771,11 @@ class GRU(Recurrent):
 
         # out deltas
         if self.out_deltas_buffer:  # save a bit of computation
-            self.be.compound_dot(self.W_input.T, self.rzhcan_delta_buffer, self.out_deltas_buffer,
+            self.be.compound_dot(self.W_input.T, self.rzhcan_delta_buffer,
+                                 self.out_deltas_buffer.reshape(self.nin, -1),
                                  alpha=alpha, beta=beta)
 
+        self.final_hidden_error[:] = self.h_delta[0]
         return self.out_deltas_buffer
 
 
@@ -1107,6 +1134,8 @@ class BiRNN(ParameterLayer):
             self.out_deltas_buffer_b = self.out_deltas_buffer
         self.out_delta_f = get_steps(self.out_deltas_buffer_f, self.i_shape)
         self.out_delta_b = get_steps(self.out_deltas_buffer_b, self.i_shape)
+        self.out_deltas_buffer_f_v = self.out_deltas_buffer_f.reshape(nin, -1)
+        self.out_deltas_buffer_b_v = self.out_deltas_buffer_b.reshape(nin, -1)
 
     def init_buffers(self, inputs):
         """
@@ -1128,15 +1157,18 @@ class BiRNN(ParameterLayer):
             assert inputs.size == self.nin * self.nsteps * self.be.bsz
 
             self.x = inputs.reshape(self.nin, self.nsteps * self.be.bsz)
+            nin = self.i_shape[0]
             if self.split_inputs:
-                self.x_f = self.x[:self.i_shape[0]]
-                self.x_b = self.x[self.i_shape[0]:]
+                self.x_f = self.x[:nin]
+                self.x_b = self.x[nin:]
             else:
                 self.x_f = self.x
                 self.x_b = self.x
 
             self.xs_f = get_steps(self.x_f, self.i_shape)
             self.xs_b = get_steps(self.x_b, self.i_shape)
+            self.x_f_v = self.x_f.reshape(nin, -1)
+            self.x_b_v = self.x_b.reshape(nin, -1)
 
     def init_params(self, shape):
         """
@@ -1235,9 +1267,8 @@ class BiRNN(ParameterLayer):
             self.h_b_last[:] = self.h_b[0]
 
         # Use single multiply for W_input
-        nin = self.nin if not self.split_inputs else (self.nin // 2)
-        self.be.compound_dot(self.W_input_f, self.x_f.reshape((nin, -1)), self.h_buffer_f)
-        self.be.compound_dot(self.W_input_b, self.x_b.reshape((nin, -1)), self.h_buffer_b)
+        self.be.compound_dot(self.W_input_f, self.x_f_v, self.h_buffer_f)
+        self.be.compound_dot(self.W_input_b, self.x_b_v, self.h_buffer_b)
 
         self.be.compound_rnn_unroll_fprop(self.W_recur_f, self.h_prev,
                                           self.h_f, self.h_f, self.b_f,
@@ -1280,8 +1311,6 @@ class BiRNN(ParameterLayer):
             self.in_deltas_b = get_steps(error[self.nout:], self.o_shape)
             self.next_in_deltas = self.in_deltas_b[1:] + [self.next_in_deltas_last]
 
-        nin = self.nin if not self.split_inputs else (self.nin // 2)
-
         self.out_deltas_buffer[:] = 0
 
         self.be.compound_rnn_unroll_bprop(self.W_recur_f.T, self.prev_in_deltas,
@@ -1309,18 +1338,18 @@ class BiRNN(ParameterLayer):
         h_next_all = self.h_buffer_b[:, self.be.bsz:]
         self.be.compound_dot(in_deltas_cur_b, h_next_all.T, self.dW_recur_b)
 
-        self.be.compound_dot(in_deltas_all_f, self.x_f.reshape((nin, -1)).T, self.dW_input_f)
+        self.be.compound_dot(in_deltas_all_f, self.x_f_v.T, self.dW_input_f)
         self.db_f[:] = self.be.sum(in_deltas_all_f, axis=1)
         if self.out_deltas_buffer_f:
             self.be.compound_dot(self.W_input_f.T, in_deltas_all_f,
-                                 self.out_deltas_buffer_f.reshape((nin, -1)),
+                                 self.out_deltas_buffer_f_v,
                                  alpha=alpha, beta=beta)
 
-        self.be.compound_dot(in_deltas_all_b, self.x_b.reshape((nin, -1)).T, self.dW_input_b)
+        self.be.compound_dot(in_deltas_all_b, self.x_b_v.T, self.dW_input_b)
         self.db_b[:] = self.be.sum(in_deltas_all_b, axis=1)
         if self.out_deltas_buffer_b:
             self.be.compound_dot(self.W_input_b.T, in_deltas_all_b,
-                                 self.out_deltas_buffer_b.reshape((nin, -1)),
+                                 self.out_deltas_buffer_b_v,
                                  alpha=alpha, beta=beta)
 
         return self.out_deltas_buffer
@@ -1441,8 +1470,6 @@ class BiBNRNN(BiRNN):
                                   **self.get_param_attrs())
         self.gamma = self.be.ones((nf, 1), dtype=self.stats_dtype,
                                   **self.get_param_attrs())
-        # self.gmean = self.be.zeros((nf, 1), dtype=self.stats_dtype)
-        # self.gvar = self.be.zeros((nf, 1), dtype=self.stats_dtype)
 
         self.params = [self.beta, self.gamma]
         self.grad_params = [self.be.zeros_like(p) for p in self.params]
@@ -1508,9 +1535,8 @@ class BiBNRNN(BiRNN):
             self.h_b_last[:] = self.h_b[0]
 
         # Use single multiply for W_input
-        nin = self.nin if not self.split_inputs else (self.nin // 2)
-        self.be.compound_dot(self.W_input_f, self.x_f.reshape((nin, -1)), self.h_ff_buffer_f)
-        self.be.compound_dot(self.W_input_b, self.x_b.reshape((nin, -1)), self.h_ff_buffer_b)
+        self.be.compound_dot(self.W_input_f, self.x_f_v, self.h_ff_buffer_f)
+        self.be.compound_dot(self.W_input_b, self.x_b_v, self.h_ff_buffer_b)
 
         self._fprop_bn(self.h_ff_buffer, inference)
 
@@ -1568,8 +1594,6 @@ class BiBNRNN(BiRNN):
             self.in_deltas_b = get_steps(error[self.nout:], self.o_shape)
             self.next_in_deltas = self.in_deltas_b[1:] + self.in_deltas_b[:1]
 
-        nin = self.nin if not self.split_inputs else (self.nin // 2)
-
         self.out_deltas_buffer[:] = 0
 
         self.be.compound_rnn_unroll_bprop(self.W_recur_f.T, self.prev_in_deltas,
@@ -1600,18 +1624,18 @@ class BiBNRNN(BiRNN):
         self._bprop_bn(error, self.h_ff_buffer)
 
         # bprop through the ff
-        self.be.compound_dot(in_deltas_all_f, self.x_f.reshape((nin, -1)).T, self.dW_input_f)
+        self.be.compound_dot(in_deltas_all_f, self.x_f_v.T, self.dW_input_f)
         self.db_f[:] = self.be.sum(in_deltas_all_f, axis=1)
         if self.out_deltas_buffer_f:
             self.be.compound_dot(self.W_input_f.T, in_deltas_all_f,
-                                 self.out_deltas_buffer_f.reshape((nin, -1)),
+                                 self.out_deltas_buffer_f_v,
                                  alpha=alpha, beta=beta)
 
-        self.be.compound_dot(in_deltas_all_b, self.x_b.reshape((nin, -1)).T, self.dW_input_b)
+        self.be.compound_dot(in_deltas_all_b, self.x_b_v.T, self.dW_input_b)
         self.db_b[:] = self.be.sum(in_deltas_all_b, axis=1)
         if self.out_deltas_buffer_b:
             self.be.compound_dot(self.W_input_b.T, in_deltas_all_b,
-                                 self.out_deltas_buffer_b.reshape((nin, -1)),
+                                 self.out_deltas_buffer_b_v,
                                  alpha=alpha, beta=beta if self.split_inputs else 1.0)
 
         return self.out_deltas_buffer
@@ -1813,8 +1837,7 @@ class BiLSTM(BiRNN):
         if self.in_deltas_f is None:
             self.in_deltas_f = get_steps(error[:self.o_shape[0]], self.o_shape)
             self.prev_in_deltas = self.in_deltas_f[-1:] + self.in_deltas_f[:-1]
-            self.ifog_delta_last_steps = self.ifog_delta_buffer[
-                :, self.be.bsz:]
+            self.ifog_delta_last_steps = self.ifog_delta_buffer[:, self.be.bsz:]
             self.h_first_steps = self.h_buffer_f[:, :-self.be.bsz]
             # h_delta[5] * h[4] + h_delta[4] * h[3] + ... + h_delta[1] * h[0]
 
@@ -1869,7 +1892,8 @@ class BiLSTM(BiRNN):
         # out deltas to input units
         if self.out_deltas_buffer:
             self.be.compound_dot(
-                self.W_input_f.T, self.ifog_delta_buffer, self.out_deltas_buffer_f,
+                self.W_input_f.T, self.ifog_delta_buffer,
+                self.out_deltas_buffer_f_v,
                 alpha=alpha, beta=beta)
 
         # bprop for backward direction connections. Error flow from left to right
@@ -1904,7 +1928,8 @@ class BiLSTM(BiRNN):
         # split_inputs=False
         if self.out_deltas_buffer:
             self.be.compound_dot(self.W_input_b.T, self.ifog_delta_buffer,
-                                 self.out_deltas_buffer_b, alpha=alpha,
+                                 self.out_deltas_buffer_b_v,
+                                 alpha=alpha,
                                  beta=beta if self.inputs else 1.0)
 
         return self.out_deltas_buffer

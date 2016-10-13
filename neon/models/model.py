@@ -23,7 +23,8 @@ from neon.backends.backend import Block
 from neon.transforms import CrossEntropyBinary, Logistic
 from neon.util.persist import load_obj, save_obj, load_class
 from neon.util.modeldesc import ModelDescription
-from neon.layers import Sequential, Activation, Tree, SingleOutputTree
+from neon.layers import Sequential, Activation, Tree, SingleOutputTree, Seq2Seq
+from neon.layers.container import DeltasTree
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ class Model(NervanaObject):
             self.load_params(layers, load_states=(not weights_only))
         else:
             # Wrap the list of layers in a Sequential container if a raw list of layers
-            if type(layers) in (Sequential, Tree, SingleOutputTree):
+            if type(layers) in (Sequential, Tree, SingleOutputTree, Seq2Seq):
                 self.layers = layers
             else:
                 self.layers = Sequential(layers)
@@ -120,6 +121,18 @@ class Model(NervanaObject):
         self.layers.allocate()
         self.layers.allocate_deltas()
         self.initialized = True
+
+    def allocate_deltas(self):
+        if getattr(self, 'global_deltas', None) is None:
+            self.global_deltas = DeltasTree()
+            self.layers.allocate_deltas(self.global_deltas)
+
+            # allocate the buffers now that all the
+            # nesting and max sizes have been determined
+            self.global_deltas.allocate_buffers(self.be)
+
+        # set the deltas
+        self.layers.set_deltas(self.global_deltas)
 
     def __str__(self):
         """
@@ -241,6 +254,10 @@ class Model(NervanaObject):
         running_error = np.zeros((len(metric.metric_names)), dtype=np.float32)
         nprocessed = 0
         dataset.reset()
+        if hasattr(dataset, 'seq_length'):
+            ndata = dataset.ndata*dataset.seq_length
+        else:
+            ndata = dataset.ndata
         for x, t in dataset:
             x = self.fprop(x, inference=True)
 
@@ -248,7 +265,7 @@ class Model(NervanaObject):
             nsteps = x.shape[1] // self.be.bsz if not isinstance(x, list) else \
                 x[0].shape[1] // self.be.bsz
 
-            bsz = min(dataset.ndata - nprocessed, self.be.bsz)
+            bsz = min(ndata - nprocessed, self.be.bsz)
             running_error += metric(x, t, calcrange=slice(0, nsteps * bsz)) * nsteps * bsz
             nprocessed += bsz * nsteps
         running_error /= nprocessed
@@ -259,7 +276,7 @@ class Model(NervanaObject):
         Get the activation outputs of the final model layer for the dataset
 
         Arguments:
-            dataset (NervanaDataIterator) Dataset iterator to perform fit on
+            dataset (NervanaDataIterator): Dataset iterator to perform fit on
 
         Returns:
             Host numpy array: the output of the final layer for the entire Dataset
@@ -491,6 +508,7 @@ class Model(NervanaObject):
         # initialize model
         if inference is False and (cost is None or optimizer is None):
             raise RuntimeError("Need cost and optimizer to benchmark bprop")
+
         self.cost = cost
         self.initialize(dataset, cost)
         self.optimizer = optimizer
@@ -514,7 +532,7 @@ class Model(NervanaObject):
 
                 self.be.record_mark(fprop_start)  # mark start of fprop
 
-                x = self.fprop(x)
+                x = self.fprop(x, inference)
 
                 if inference is False:
                     self.total_cost[:] = self.total_cost + self.cost.get_cost(x, t)

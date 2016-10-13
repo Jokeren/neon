@@ -31,7 +31,8 @@ from neon import NervanaObject, logger as neon_logger
 from neon.data import NervanaDataIterator, Ticker
 from neon.util.compat import PY3
 from neon.util.persist import load_obj, save_obj, load_class
-from neon.layers import Convolution, BatchNorm
+from neon.layers import Convolution, BatchNorm, Multicost
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,7 +55,8 @@ class Callbacks(NervanaObject):
                  history=1,
                  model_file=None,
                  eval_set=None,
-                 metric=None):
+                 metric=None,
+                 log_token=None):
         """
         Create a callbacks container with the default callbacks.
 
@@ -124,6 +126,13 @@ class Callbacks(NervanaObject):
 
         self.add_callback(TrainLoggerCallback())
         self.add_callback(RunTimerCallback())
+
+        try:
+            # Register if it exists
+            from cloud_metrics import CloudMetricsCallback
+            self.add_callback(CloudMetricsCallback(log_token, eval_freq, metric))
+        except ImportError:
+            pass
 
     def __del__(self):
         try:
@@ -633,6 +642,110 @@ class TrainCostCallback(Callback):
         mean_cost = sum(self.cost_history) / len(self.cost_history)
         mbstart = callback_data['time_markers/minibatch'][epoch - 1] if epoch > 0 else 0
         callback_data['cost/train'][mbstart + minibatch] = mean_cost
+
+
+class TrainMulticostCallback(Callback):
+    """
+    Callback for computing average training cost periodically during training.
+    """
+    def __init__(self, wsz=10):
+        super(TrainMulticostCallback, self).__init__(epoch_freq=1)
+        self.wsz = wsz
+
+    def on_train_begin(self, callback_data, model, epochs):
+        """
+        Called when training is about to begin
+
+        Arguments:
+            callback_data (HDF5 dataset): shared data between callbacks
+            model (Model): model object
+            epochs (int): Total epochs
+        """
+        # get number of costs
+        assert isinstance(model.cost, Multicost), "Cost must be a Multicost"
+        self.ncosts = len(model.cost.costs)
+        # get number of nested-costs
+        self.ncosts_allbranches = sum([self.recursive_multicost_len(c) for c in model.cost.costs])
+
+        # preallocate space for the number of minibatches in the whole run
+        points = callback_data['config'].attrs['total_minibatches']
+        callback_data.create_dataset("multicost/train", (points, self.ncosts), dtype='float64')
+        callback_data.create_dataset("multicost/train_allbranches",
+                                     (points, self.ncosts_allbranches), dtype='float64')
+
+        # make sure our window size is less than or equal to total number of minibatches
+        self.wsz = min(points, self.wsz)
+        self.cost_history = deque([], maxlen=self.wsz)
+
+        # clue in the data reader to use the 'minibatch' time_markers
+        callback_data['multicost/train'].attrs['time_markers'] = 'minibatch'
+        callback_data['multicost/train_allbranches'].attrs['time_markers'] = 'minibatch'
+
+    def on_minibatch_end(self, callback_data, model, epoch, minibatch):
+        """
+        Called when minibatch is about to end
+
+        Arguments:
+            callback_data (HDF5 dataset): shared data between callbacks
+            model (Model): model object
+            epoch (int): index of current epoch
+            minibatch (int): index of minibatch that is ending
+        """
+        costs = np.array([c.cost for c in model.cost.costs])
+        self.cost_history.append(costs)
+        mean_cost = sum(self.cost_history) / len(self.cost_history)
+        mbstart = callback_data['time_markers/minibatch'][epoch-1] if epoch > 0 else 0
+        callback_data['multicost/train'][mbstart + minibatch, :] = mean_cost.squeeze()
+
+        # Extract all nested-multicosts
+        costs_allbranches = np.array([self.multicost_recurse(c) for c in model.cost.costs])
+        # Subtract non-trunk branches from summed trunk cost to get individual branch costs
+        costs_allbranches = self.separate_branch_costs(costs_allbranches)
+        callback_data['multicost/train_allbranches'][mbstart + minibatch, :] =\
+            costs_allbranches.squeeze()
+
+    def multicost_recurse(self, x):
+        """
+        Called on a cost object to extract all costs of nested-multicosts, else return main cost.
+
+        Arguments:
+            x (Cost): cost object
+        """
+        # recurse into nested multicosts to grab all cost branches
+        if type(x) == Multicost:
+            return [z for z in map(self.multicost_recurse, x.costs)]
+        else:
+            return x.cost
+
+    def separate_branch_costs(self, x):
+        """
+        Called on list of lists of costs, where each nested list is a separate multicost,
+        and returns the un-summed individual branch costs.
+
+        Arguments:
+           x (list): list of lists of costs as returned by multicost_recurse
+        """
+        # Subtract branch costs from total cost
+        x[0] -= np.sum([c[0] if type(c) == list else c for c in x[1:]])
+        # Recurse into non-trunk branches
+        for branch in x:
+            if type(branch) == list:
+                self.separate_branch_costs(branch)
+        # Return a flattened version of the list
+        return np.array([item for sublist in x for item in sublist])
+
+    def recursive_multicost_len(self, item):
+        """
+        Called on a cost object and returns the number of actual cost values.
+
+        Arguments:
+           item (Cost): cost object
+        """
+        # compute number of costs nested in multicosts
+        if type(item) == Multicost:
+            return sum(self.recursive_multicost_len(subitem) for subitem in item.costs)
+        else:
+            return 1
 
 
 class LossCallback(Callback):
